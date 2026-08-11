@@ -1,0 +1,51 @@
+# This repository has no third-party Go modules, so the usual reason for
+# Dependabot does not apply. Two things do move underneath it anyway:
+#
+#   - The GitHub Actions in .github/workflows. Actions go stale quietly: a
+#     pinned major keeps working for a long time while its runtime is
+#     deprecated, which is how every action here ended up several majors behind.
+#   - The Dockerfile's build stage, pinned to an exact Go patch release so the
+#     build is reproducible. That pin is deliberate, and it is precisely what
+#     needs an automatic bump when a patch release lands, since a stale builder
+#     means missing Go toolchain security fixes.
+#
+# gomod is listed too. It has nothing to do today, but it will the moment a
+# dependency is ever added.
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    labels:
+      - dependencies
+    # One pull request for all of them: they are updated together in practice,
+    # and each pull request runs the full integration suite.
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+    labels:
+      - dependencies
+
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: deps
+    labels:
+      - dependencies

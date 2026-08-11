@@ -18,12 +18,15 @@ jobs:
     name: Build and unit test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
+          # No third-party dependencies means no go.sum, which the module cache
+          # keys on: leaving it enabled only produces a "Dependencies file is
+          # not found" warning on every run.
+          cache: false
 
       - name: Check formatting
         run: |
@@ -50,7 +53,7 @@ jobs:
         run: CGO_ENABLED=0 go build -trimpath -o bin/mysql-old-password-proxy .
 
       - name: Image builds
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
@@ -64,12 +67,15 @@ jobs:
     # images, so it is slower than the unit tests but still well under an hour.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
+          # No third-party dependencies means no go.sum, which the module cache
+          # keys on: leaving it enabled only produces a "Dependencies file is
+          # not found" warning on every run.
+          cache: false
 
       - name: Pre-pull images
         run: |
@@ -85,12 +91,15 @@ jobs:
     name: Vulnerability scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-          cache: true
+          # No third-party dependencies means no go.sum, which the module cache
+          # keys on: leaving it enabled only produces a "Dependencies file is
+          # not found" warning on every run.
+          cache: false
 
       # There are no third-party dependencies, so this is really a check on the
       # Go standard library and toolchain version.
