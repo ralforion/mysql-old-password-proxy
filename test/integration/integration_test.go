@@ -87,6 +87,7 @@ func TestProxy(t *testing.T) {
 		t.Skip("docker not found")
 	}
 	binary := buildProxy(t)
+	pullImages(t)
 
 	for _, image := range serverImages {
 		t.Run(strings.NewReplacer(":", "-", ".", "-").Replace(image), func(t *testing.T) {
@@ -304,7 +305,13 @@ func (e *env) waitForProbe(timeout time.Duration) {
 func (e *env) addr() string { return fmt.Sprintf("127.0.0.1:%d", e.relayPort) }
 
 // clientRun runs a stock client from an image against the proxy.
-func (e *env) clientRun(t *testing.T, image, binary, user, pass, db, sql string) (string, error) {
+//
+// stdout and stderr are kept apart deliberately. Query results come back on
+// stdout, while docker writes image-pull progress and the client writes its
+// warnings and errors to stderr — so combining them makes a result comparison
+// depend on whether the image happened to be cached, which is the difference
+// between a warm laptop and a cold CI runner.
+func (e *env) clientRun(t *testing.T, image, binary, user, pass, db, sql string) (stdout, stderr string, err error) {
 	t.Helper()
 	args := []string{"run", "--rm", "--platform", "linux/amd64",
 		"--add-host", "host.docker.internal:host-gateway", image, binary,
@@ -316,10 +323,40 @@ func (e *env) clientRun(t *testing.T, image, binary, user, pass, db, sql string)
 	if db != "" {
 		args = append(args, db)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
-	return stripWarnings(string(out)), err
+
+	var outBuf, errBuf bytes.Buffer
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err = cmd.Run()
+	return stripWarnings(outBuf.String()), stripWarnings(errBuf.String()), err
+}
+
+// pullImages fetches every image the suite uses, before anything is timed or
+// compared. Failures are not fatal: the individual docker run would pull it
+// anyway, and this is only here to keep the first use of an image cheap.
+func pullImages(t *testing.T) {
+	t.Helper()
+	seen := map[string]bool{}
+	var wg sync.WaitGroup
+	for _, image := range serverImages {
+		seen[image] = true
+	}
+	for _, c := range clientImages {
+		seen[c.image] = true
+	}
+	for image := range seen {
+		wg.Add(1)
+		go func(image string) {
+			defer wg.Done()
+			if out, err := exec.Command("docker", "pull", "--platform", "linux/amd64", image).CombinedOutput(); err != nil {
+				t.Logf("pre-pull %s: %v: %s", image, err, out)
+			}
+		}(image)
+	}
+	wg.Wait()
 }
 
 func stripWarnings(s string) string {
@@ -369,10 +406,10 @@ func (b *lockedBuffer) String() string {
 func (e *env) testStockClients(t *testing.T) {
 	for _, c := range clientImages {
 		t.Run(c.name, func(t *testing.T) {
-			out, err := e.clientRun(t, c.image, c.binary, frontUser, frontPass, testDB,
+			out, errOut, err := e.clientRun(t, c.image, c.binary, frontUser, frontPass, testDB,
 				"SELECT id, name FROM widgets ORDER BY id")
 			if err != nil {
-				t.Fatalf("query through the proxy failed: %v\n%s", err, out)
+				t.Fatalf("query through the proxy failed: %v\n%s", err, errOut)
 			}
 			if want := "1\tfirst\n2\tsecond\n3\tthird"; out != want {
 				t.Errorf("got:\n%s\nwant:\n%s", out, want)
@@ -391,12 +428,13 @@ func (e *env) testCredentials(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			out, err := e.clientRun(t, "mysql:5.6", "mysql", tc.user, tc.pass, testDB, "SELECT 1")
+			out, errOut, err := e.clientRun(t, "mysql:5.6", "mysql", tc.user, tc.pass, testDB, "SELECT 1")
 			if err == nil {
 				t.Fatalf("the proxy accepted %s: %s", tc.name, out)
 			}
-			if !strings.Contains(out, "Access denied") {
-				t.Errorf("want an Access denied error, got: %s", out)
+			// The client writes its rejection to stderr.
+			if !strings.Contains(errOut, "Access denied") {
+				t.Errorf("want an Access denied error, got: %s", errOut)
 			}
 		})
 	}
@@ -405,10 +443,10 @@ func (e *env) testCredentials(t *testing.T) {
 // testUTF8MB4Rewrite proves the rewrite fires: the client asks for utf8mb4 and
 // the session the legacy server actually sees is utf8.
 func (e *env) testUTF8MB4Rewrite(t *testing.T) {
-	out, err := e.clientRun(t, "mysql:5.6", "mysql", frontUser, frontPass, testDB,
+	out, errOut, err := e.clientRun(t, "mysql:5.6", "mysql", frontUser, frontPass, testDB,
 		"SET NAMES utf8mb4; SELECT @@session.character_set_client")
 	if err != nil {
-		t.Fatalf("SET NAMES utf8mb4 failed through the proxy: %v\n%s", err, out)
+		t.Fatalf("SET NAMES utf8mb4 failed through the proxy: %v\n%s", err, errOut)
 	}
 	if out != "utf8" {
 		t.Errorf("character_set_client = %q, want utf8 (the rewrite did not fire)", out)
@@ -417,10 +455,10 @@ func (e *env) testUTF8MB4Rewrite(t *testing.T) {
 
 // testNonASCIIRoundTrip guards the rewrite against mangling real data.
 func (e *env) testNonASCIIRoundTrip(t *testing.T) {
-	out, err := e.clientRun(t, "mysql:5.6", "mysql", frontUser, frontPass, testDB,
+	out, errOut, err := e.clientRun(t, "mysql:5.6", "mysql", frontUser, frontPass, testDB,
 		"SET NAMES utf8mb4; SELECT note FROM widgets WHERE id IN (1,3) ORDER BY id")
 	if err != nil {
-		t.Fatalf("%v\n%s", err, out)
+		t.Fatalf("%v\n%s", err, errOut)
 	}
 	if want := "Grüße\n日本語"; out != want {
 		t.Errorf("got %q, want %q", out, want)
