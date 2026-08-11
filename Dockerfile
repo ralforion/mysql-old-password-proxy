@@ -21,7 +21,14 @@
 # Its version is pinned exactly, and must be at least the version in go.mod —
 # a floating tag that drifted lower would make the toolchain download the right
 # one mid-build, which needs network access and is not reproducible.
-FROM golang:1.26.5-alpine AS build
+#
+# --platform=$BUILDPLATFORM pins this stage to the architecture of the machine
+# doing the building, and Go then cross-compiles to $TARGETARCH. Without it,
+# buildx runs the whole stage under the *target* architecture — meaning the Go
+# compiler itself executes under QEMU emulation for every foreign platform,
+# which turns a seconds-long build into a minutes-long one. Go cross-compiles
+# natively with CGO off, so emulation buys nothing here.
+FROM --platform=$BUILDPLATFORM golang:1.26.5-alpine AS build
 
 WORKDIR /src
 
@@ -39,10 +46,11 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" \
     -o /out/mysql-old-password-proxy .
 
-# Verify it really is static: a dynamically linked binary would fail on scratch
-# at runtime rather than here.
-RUN ! ldd /out/mysql-old-password-proxy 2>/dev/null | grep -q "=>" || \
-    (echo "binary is dynamically linked" && exit 1)
+# CGO_ENABLED=0 on a package tree that imports no cgo is what actually
+# guarantees a static binary, and the release workflow proves it by running the
+# published image — which has no dynamic linker to fall back on. An ldd check
+# here would be theatre: cross-compiled output cannot be inspected by the build
+# platform's ldd anyway, so it would pass without testing anything.
 
 FROM scratch
 
