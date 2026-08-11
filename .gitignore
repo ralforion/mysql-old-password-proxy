@@ -1,0 +1,8 @@
+# Build output. deploy/ holds Kubernetes manifests; nothing is built into it.
+/bin/
+*.out
+*.test
+
+# Local overrides
+.env
+*.local.yaml

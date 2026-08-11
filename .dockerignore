@@ -1,0 +1,12 @@
+# Keep the build context to what the image actually needs to compile.
+.git
+.github
+bin
+deploy
+docs
+test
+*.md
+!go.mod
+Makefile
+.gitignore
+.dockerignore

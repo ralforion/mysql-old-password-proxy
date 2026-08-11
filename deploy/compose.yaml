@@ -1,0 +1,40 @@
+# Docker Compose deployment, for running the proxy outside Kubernetes.
+#
+#   MYSQL_RELAY_BACKEND_PASSWORD=... MYSQL_RELAY_FRONTEND_PASSWORD=... \
+#     docker compose -f deploy/compose.yaml up -d
+#
+# Passwords come from the environment, never from this file: anything written
+# here ends up in the repository and in `docker inspect`.
+services:
+  proxy:
+    image: ${IMAGE:-ralforion/mysql-old-password-proxy:latest}
+    restart: unless-stopped
+    command:
+      - -listen=:3306
+      - -health-addr=:8081
+      - -backend=${LEGACY_HOST:?set LEGACY_HOST to host:port of the legacy MySQL server}
+      - -backend-user=${LEGACY_USER:?set LEGACY_USER}
+      - -rewrite-utf8mb4=true
+    environment:
+      MYSQL_RELAY_BACKEND_PASSWORD: ${MYSQL_RELAY_BACKEND_PASSWORD:?set it in the environment}
+      MYSQL_RELAY_FRONTEND_PASSWORD: ${MYSQL_RELAY_FRONTEND_PASSWORD:?set it in the environment}
+      GOMEMLIMIT: 96MiB
+    ports:
+      # Bind to localhost: both hops are plaintext, so the proxy has no business
+      # listening on a public interface.
+      - "127.0.0.1:3306:3306"
+      - "127.0.0.1:8081:8081"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    user: "65532:65532"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    # The image is a single static binary with no shell, so the health check
+    # runs from outside it.
+    healthcheck:
+      test: ["CMD-SHELL", "exit 0"]
+      disable: true

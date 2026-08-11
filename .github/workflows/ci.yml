@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build and unit test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Unit tests
+        run: go test -race -count=1 ./...
+
+      - name: Coverage
+        run: |
+          mkdir -p bin
+          go test -coverpkg=./internal/... -coverprofile=bin/cover.out ./test/unit/...
+          go tool cover -func=bin/cover.out | tail -1
+
+      - name: Build
+        run: CGO_ENABLED=0 go build -trimpath -o bin/mysql-old-password-proxy .
+
+      - name: Image builds
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: |
+            VERSION=ci-${{ github.sha }}
+
+  integration:
+    name: Integration (real MySQL servers)
+    runs-on: ubuntu-latest
+    # The suite starts MySQL 5.5 and 5.6 containers and pulls three client
+    # images, so it is slower than the unit tests but still well under an hour.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Pre-pull images
+        run: |
+          for image in mysql:5.5 mysql:5.6 mysql:8.0 mariadb:10.11; do
+            docker pull --platform linux/amd64 "$image" &
+          done
+          wait
+
+      - name: Integration tests
+        run: go test -tags integration -count=1 -timeout 40m -v ./test/integration/...
+
+  security:
+    name: Vulnerability scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # There are no third-party dependencies, so this is really a check on the
+      # Go standard library and toolchain version.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
