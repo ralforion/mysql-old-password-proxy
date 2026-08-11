@@ -52,6 +52,16 @@ spec:
       labels:
         app.kubernetes.io/name: mysql-old-password-proxy
     spec:
+      # Pin the pods to a node pool if your cluster enforces one. This matters
+      # more than usual here: the legacy server authorises per user@host, pods
+      # SNAT to their node IP, and so the set of nodes these pods can land on is
+      # exactly the set of IPs that needs a grant on the legacy server. Leaving
+      # it unset means any node in the cluster, and a grant for every one of
+      # them.
+      # nodeSelector:
+      #   your.domain/node-role: some-pool
+      # tolerations: []
+
       # Keep the two replicas off the same node, so losing a node does not take
       # the query path with it.
       topologySpreadConstraints:

@@ -113,6 +113,7 @@ statements larger than 16 MB, which the protocol splits across packets.
 | `-fake-ok-regex` | *empty* | statements answered OK without reaching the backend |
 | `-log-queries` | `false` | log every `COM_QUERY` (verbose; may expose data) |
 | `-max-connections` | `0` | cap on concurrent sessions, each holding one backend connection (0 = unlimited) |
+| `-frontend-password-from-backend` | `false` | let clients authenticate with the legacy password instead of a separate one |
 | `-health-addr` | `:8081` | HTTP `/healthz` and `/readyz`; empty disables |
 | `-dial-timeout` | `10s` | connecting to the backend |
 | `-auth-timeout` | `30s` | completing authentication on either side |
@@ -129,6 +130,31 @@ process list and in `kubectl describe pod`:
 
 The two credentials are independent. Rotating the client-facing one does not
 require touching the legacy server.
+
+### Why there are two, and how to have one
+
+The client's password cannot be forwarded to the legacy server, because the
+proxy never receives it. MySQL authentication is challenge–response: a client
+sends `SHA1(pw) XOR SHA1(scramble ‖ SHA1(SHA1(pw)))` against a random scramble,
+which is one-way and salted per connection. The legacy side then needs a
+different algorithm over the *raw* password bytes, against its own scramble. So
+the proxy has to hold the legacy password, and has to run a complete, separate
+authentication on each side. There is no pass-through arrangement.
+
+What it can do is use the *same* password for both, so there is only one
+credential to deploy:
+
+```
+-frontend-password-from-backend        # and leave MYSQL_RELAY_FRONTEND_PASSWORD unset
+```
+
+Consider what that costs before using it. The legacy password then lives in
+every client's configuration, and a password on a server nobody can run
+`ALTER USER` against is usually one nobody can rotate either — so a leak from a
+client config becomes a problem you cannot fix. A separate frontend password
+keeps the legacy one in exactly one place, and lets you rotate the
+client-facing credential freely. Without the flag, a missing frontend password
+is a startup error rather than a silent fallback.
 
 `-server-version` is worth tuning. Claim too new and a driver assumes features
 the legacy server lacks; too old and some drivers refuse to connect at all.

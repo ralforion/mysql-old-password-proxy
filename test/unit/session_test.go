@@ -820,3 +820,25 @@ func TestMaxConnections(t *testing.T) {
 		t.Errorf("third session: %q", got)
 	}
 }
+
+// TestReuseBackendPassword covers the single-credential deployment: clients
+// authenticate with the legacy server's own password, which the relay still
+// verifies itself. The two sides remain separate authentications — the client's
+// response cannot be forwarded, because it is a one-way function of a scramble
+// only the relay chose.
+func TestReuseBackendPassword(t *testing.T) {
+	be := newFakeBackend(t, switchBare, caps50, legacyUser, legacyPass)
+	addr, _ := startRelay(t, be, func(c *relay.Config) {
+		c.FrontendUser = legacyUser
+		c.FrontendPass = legacyPass // what -frontend-password-from-backend arranges
+	})
+
+	c := mustDial(t, addr, loginOpts{user: legacyUser, pass: legacyPass, db: "legacydb"})
+	if got := c.query(t, "SELECT 1"); got != "SELECT 1" {
+		t.Errorf("the backend saw %q", got)
+	}
+	// Verification still happens: the same password, but still checked.
+	if _, p := dial(t, addr, loginOpts{user: legacyUser, pass: "wrong", db: "legacydb"}); !mysqlwire.IsErr(p) {
+		t.Error("the relay accepted a wrong password when reusing the backend one")
+	}
+}

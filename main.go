@@ -82,18 +82,20 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
 	var (
-		listenAddr  = flag.String("listen", ":3306", "address to listen on for clients")
-		healthAddr  = flag.String("health-addr", ":8081", "address for the HTTP health endpoint (empty disables it)")
-		backendAddr = flag.String("backend", "", "legacy MySQL server host:port (required)")
-		backendUser = flag.String("backend-user", "", "username on the legacy server (required)")
-		frontendUsr = flag.String("frontend-user", "", "username clients must present (defaults to -backend-user)")
-		serverVer   = flag.String("server-version", "5.5.62-auth-relay", "version string advertised to clients")
-		rewriteMB4  = flag.Bool("rewrite-utf8mb4", true, "rewrite utf8mb4 to utf8 in queries (MySQL 5.0 has no utf8mb4)")
-		fakeOKRe    = flag.String("fake-ok-regex", "", "regexp; matching COM_QUERY statements are answered OK without reaching the backend")
-		logQueries  = flag.Bool("log-queries", false, "log every COM_QUERY (verbose; may expose data)")
-		dialTimeout = flag.Duration("dial-timeout", 10*time.Second, "timeout for connecting to the backend")
-		authTimeout = flag.Duration("auth-timeout", 30*time.Second, "timeout for completing authentication on either side")
-		maxConns    = flag.Int("max-connections", 0, "maximum concurrent client sessions, each holding one backend connection (0 = unlimited)")
+		listenAddr    = flag.String("listen", ":3306", "address to listen on for clients")
+		healthAddr    = flag.String("health-addr", ":8081", "address for the HTTP health endpoint (empty disables it)")
+		backendAddr   = flag.String("backend", "", "legacy MySQL server host:port (required)")
+		backendUser   = flag.String("backend-user", "", "username on the legacy server (required)")
+		frontendUsr   = flag.String("frontend-user", "", "username clients must present (defaults to -backend-user)")
+		serverVer     = flag.String("server-version", "5.5.62-auth-relay", "version string advertised to clients")
+		rewriteMB4    = flag.Bool("rewrite-utf8mb4", true, "rewrite utf8mb4 to utf8 in queries (MySQL 5.0 has no utf8mb4)")
+		fakeOKRe      = flag.String("fake-ok-regex", "", "regexp; matching COM_QUERY statements are answered OK without reaching the backend")
+		logQueries    = flag.Bool("log-queries", false, "log every COM_QUERY (verbose; may expose data)")
+		dialTimeout   = flag.Duration("dial-timeout", 10*time.Second, "timeout for connecting to the backend")
+		authTimeout   = flag.Duration("auth-timeout", 30*time.Second, "timeout for completing authentication on either side")
+		maxConns      = flag.Int("max-connections", 0, "maximum concurrent client sessions, each holding one backend connection (0 = unlimited)")
+		frontFromBack = flag.Bool("frontend-password-from-backend", false,
+			"take the client-facing password from MYSQL_RELAY_BACKEND_PASSWORD, so clients authenticate with the legacy server's own password and only one secret has to be deployed")
 		shutdownGr  = flag.Duration("shutdown-timeout", 30*time.Second, "how long to wait for in-flight connections on SIGTERM")
 		showVersion = flag.Bool("version", false, "print the version and exit")
 	)
@@ -121,6 +123,15 @@ func main() {
 		AuthTimeout:    *authTimeout,
 		MaxConnections: *maxConns,
 	}
+	if *frontFromBack && cfg.FrontendPass == "" {
+		// One credential to deploy, at the cost of putting the legacy server's
+		// password into every client's configuration. Worth saying out loud in
+		// the log, because the password of a server nobody can run ALTER USER
+		// on is usually also a password nobody can rotate.
+		cfg.FrontendPass = cfg.BackendPass
+		log.Print("-frontend-password-from-backend: clients authenticate with the legacy server's own password; " +
+			"it will be stored in every client's configuration, and cannot be rotated without changing the legacy server")
+	}
 	switch {
 	case cfg.Backend == "":
 		log.Fatal("-backend is required (host:port of the legacy MySQL server)")
@@ -129,7 +140,7 @@ func main() {
 	case cfg.BackendPass == "":
 		log.Fatal("MYSQL_RELAY_BACKEND_PASSWORD is required")
 	case cfg.FrontendPass == "":
-		log.Fatal("MYSQL_RELAY_FRONTEND_PASSWORD is required")
+		log.Fatal("MYSQL_RELAY_FRONTEND_PASSWORD is required (or pass -frontend-password-from-backend to use the legacy one for clients too)")
 	}
 	if *fakeOKRe != "" {
 		re, err := regexp.Compile(*fakeOKRe)

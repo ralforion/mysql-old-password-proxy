@@ -67,7 +67,11 @@ process list and in `kubectl describe pod`:
 | `MYSQL_RELAY_FRONTEND_PASSWORD` | what clients present to the proxy |
 
 The two credentials are independent: rotating the client-facing one does not
-require touching the legacy server.
+require touching the legacy server. The client's password cannot simply be
+forwarded — MySQL authentication is challenge–response, so the proxy never
+receives it and must authenticate separately on each side. To deploy a single
+credential anyway, pass `-frontend-password-from-backend` and leave
+`MYSQL_RELAY_FRONTEND_PASSWORD` unset.
 
 | Flag | Default | Meaning |
 |---|---|---|
