@@ -52,9 +52,15 @@ import (
 )
 
 // FramingSafe is the set of capabilities the relay is willing to carry end to
-// end. Everything here either does not affect post-authentication framing, or
-// is negotiated identically on both sides because the offer made to clients is
-// masked by the backend's flags.
+// end: those that neither change post-authentication framing nor change what a
+// statement means. The offer made to clients is masked by the backend's flags,
+// so both sides always negotiate the same subset of it.
+//
+// CLIENT_NO_SCHEMA is the reason the second half of that sentence is there. It
+// does not touch framing at all, so an earlier version of this list included
+// it — but it tells the server to reject database.table qualifiers, which
+// quietly broke every schema-qualified query through the proxy. Framing is not
+// the only way a capability can be unsafe to carry.
 //
 // Deliberately ABSENT: CLIENT_DEPRECATE_EOF and CLIENT_SESSION_TRACK (they
 // change result-set framing), CLIENT_QUERY_ATTRIBUTES and
@@ -64,7 +70,7 @@ import (
 // sides — see the README), CLIENT_LOCAL_FILES (LOCAL INFILE turns the server
 // into a file-read request against the client).
 const FramingSafe = mysqlwire.CapLongPassword | mysqlwire.CapFoundRows |
-	mysqlwire.CapLongFlag | mysqlwire.CapConnectWithDB | mysqlwire.CapNoSchema |
+	mysqlwire.CapLongFlag | mysqlwire.CapConnectWithDB |
 	mysqlwire.CapIgnoreSpace | mysqlwire.CapProtocol41 | mysqlwire.CapTransactions |
 	mysqlwire.CapSecureConnection | mysqlwire.CapMultiStatements |
 	mysqlwire.CapMultiResults | mysqlwire.CapPSMultiResults
@@ -91,7 +97,7 @@ type Config struct {
 
 	ServerVersion  string         // version string advertised to clients
 	RewriteUTF8MB4 bool           // rewrite utf8mb4 to utf8 in COM_QUERY
-	RewriteDTP     bool           // replace DATETIME_PRECISION with 0 in information_schema queries
+	RewriteDTP     DTPMode        // when to replace DATETIME_PRECISION in information_schema queries
 	FakeOK         *regexp.Regexp // statements answered OK without reaching the backend
 	LogQueries     bool
 
@@ -149,6 +155,10 @@ type Server struct {
 	connID atomic.Uint32
 	active sync.WaitGroup
 	live   atomic.Int64 // sessions currently being relayed
+
+	// loggedVersion keeps the shim's reasoning to one line per distinct
+	// backend version, rather than one per connection.
+	loggedVersion atomic.Value
 }
 
 const capsKnownBit = 1 << 32
@@ -233,7 +243,7 @@ func (s *Server) Wait(ctx context.Context) bool {
 // cleanly. It validates the configured credentials and primes the capability
 // cache, so the ordinary path needs only one backend connection per session.
 func (s *Server) ProbeBackend() (uint32, error) {
-	conn, caps, err := s.dialBackend("", defaultCharset)
+	conn, caps, err := s.dialBackend("", defaultCharset, 0)
 	if err != nil {
 		return 0, err
 	}
@@ -288,7 +298,7 @@ func (s *Server) handle(client net.Conn, id uint32) error {
 		return fmt.Errorf("frontend auth: %w", err)
 	}
 
-	backend, serverCaps, err := s.dialBackend(fe.db, fe.charset)
+	backend, serverCaps, err := s.dialBackend(fe.db, fe.charset, EffectiveCaps(fe.caps, fe.offered))
 	if err != nil {
 		fe.writeErr(1045, "28000", "relay could not reach the legacy server: "+err.Error())
 		return fmt.Errorf("backend: %w", err)
@@ -330,6 +340,32 @@ func (s *Server) writeEarlyErr(w io.Writer, msg string) {
 // construction excludes everything absent from the relay's offer.
 func EffectiveCaps(clientCaps, offered uint32) uint32 { return clientCaps & offered }
 
+// shimDatetimePrecision decides whether this backend needs the
+// DATETIME_PRECISION substitution, and says so in the log the first time it
+// sees a given version — the reasoning is otherwise invisible, and it is the
+// first thing to check when metadata reads misbehave.
+func (s *Server) shimDatetimePrecision(version string) bool {
+	switch s.cfg.RewriteDTP {
+	case DTPNever:
+		return false
+	case DTPAlways:
+		return true
+	}
+	has, recognised := BackendHasDatetimePrecision(version)
+	if s.loggedVersion.Swap(version) != version {
+		switch {
+		case !recognised:
+			s.cfg.Logger.Printf("backend version %q not recognised; assuming it has DATETIME_PRECISION and leaving metadata queries alone. "+
+				"If they fail with \"Unknown column\", pass -rewrite-datetime-precision=always", version)
+		case has:
+			s.cfg.Logger.Printf("backend %q has DATETIME_PRECISION; metadata queries are relayed unchanged", version)
+		default:
+			s.cfg.Logger.Printf("backend %q predates DATETIME_PRECISION; substituting 0 for it in information_schema queries", version)
+		}
+	}
+	return !has
+}
+
 // CheckCapabilities enforces the invariant the whole design rests on: the
 // capabilities in force with the client must not include a framing-relevant
 // flag the relay did not also negotiate with the backend.
@@ -358,6 +394,9 @@ func CheckCapabilities(clientCaps, offered, serverCaps uint32) error {
 type backendConn struct {
 	net.Conn
 	r *bufio.Reader
+
+	version string // as the server reported it in its greeting
+	shimDTP bool   // whether this server needs the DATETIME_PRECISION shim
 }
 
 func (c *backendConn) Read(p []byte) (int, error) { return c.r.Read(p) }
@@ -371,11 +410,23 @@ func (c *backendConn) quit() {
 	c.Close()
 }
 
+// authPhase are the capabilities that matter only while authenticating. They
+// follow what the backend offers rather than what a client asked for: they say
+// nothing about the session that follows.
+const authPhase = mysqlwire.CapProtocol41 | mysqlwire.CapSecureConnection | mysqlwire.CapPluginAuth
+
 // dialBackend connects to the legacy server and completes authentication,
 // including the pre-4.1 fallback. db, if non-empty, becomes the session's
 // default schema, and charset its default character set. It returns the live
 // connection and the capability flags the server advertised.
-func (s *Server) dialBackend(db string, charset byte) (*backendConn, uint32, error) {
+//
+// clientCaps is what the client negotiated, so that the session the relay opens
+// on the far side behaves the same way as the one the client believes it has.
+// CLIENT_FOUND_ROWS is the clearest example: negotiated on one half only, an
+// UPDATE would report matched rows to one side and changed rows to the other.
+// Zero means no client — the startup probe — and negotiates only what is needed
+// to authenticate.
+func (s *Server) dialBackend(db string, charset byte, clientCaps uint32) (*backendConn, uint32, error) {
 	conn, err := net.DialTimeout("tcp", s.cfg.Backend, s.cfg.DialTimeout)
 	if err != nil {
 		return nil, 0, err
@@ -403,6 +454,7 @@ func (s *Server) dialBackend(db string, charset byte) (*backendConn, uint32, err
 	if err != nil {
 		return nil, 0, err
 	}
+	version := mysqlwire.ParseServerVersion(payload)
 	s.storeBackendCaps(serverCaps)
 	if serverCaps&mysqlwire.CapProtocol41 == 0 {
 		return nil, 0, errors.New("backend does not support the 4.1 protocol; this relay cannot speak the 3.23 handshake")
@@ -413,7 +465,7 @@ func (s *Server) dialBackend(db string, charset byte) (*backendConn, uint32, err
 	// requires it. MySQL 5.6 rejects a handshake response without it —
 	// "Bad handshake" — even for a pre-4.1 account. MySQL 5.0 does not
 	// advertise it, so nothing is claimed there.
-	caps := serverCaps & (FramingSafe | mysqlwire.CapPluginAuth)
+	caps := serverCaps & ((clientCaps & FramingSafe) | authPhase)
 	if db == "" {
 		caps &^= mysqlwire.CapConnectWithDB
 	} else if caps&mysqlwire.CapConnectWithDB == 0 {
@@ -469,7 +521,12 @@ func (s *Server) dialBackend(db string, charset byte) (*backendConn, uint32, err
 		return nil, 0, errors.New("empty auth response from backend")
 	case mysqlwire.IsOK(payload):
 		ok = true
-		return &backendConn{Conn: conn, r: r}, serverCaps, nil
+		return &backendConn{
+			Conn:    conn,
+			r:       r,
+			version: version,
+			shimDTP: s.shimDatetimePrecision(version),
+		}, serverCaps, nil
 	case mysqlwire.IsErr(payload):
 		return nil, 0, fmt.Errorf("backend rejected login: %s", mysqlwire.ErrText(payload))
 	default:
@@ -638,7 +695,7 @@ func (s *Server) clientToBackend(client *frontendConn, backend *backendConn) err
 					payload = append([]byte{mysqlwire.ComQuery}, q...)
 				}
 			}
-			if s.cfg.RewriteDTP {
+			if backend.shimDTP {
 				if nq := RewriteDatetimePrecision(q); nq != q {
 					q = nq
 					payload = append([]byte{mysqlwire.ComQuery}, q...)
@@ -698,6 +755,101 @@ func RewriteUTF8MB4(q string) string {
 		i++
 	}
 	return b.String()
+}
+
+// DTPMode controls the DATETIME_PRECISION shim.
+type DTPMode int
+
+const (
+	// DTPAuto rewrites only when the backend's version predates the column.
+	// This is the default: on the servers this proxy exists for the shim is
+	// needed, and on newer ones it would report a precision of 0 for columns
+	// that actually have fractional seconds.
+	DTPAuto DTPMode = iota
+	// DTPAlways rewrites regardless of the backend version.
+	DTPAlways
+	// DTPNever leaves the statement alone.
+	DTPNever
+)
+
+// ParseDTPMode reads the -rewrite-datetime-precision flag. "true" and "false"
+// are accepted so that the boolean form this flag originally took keeps
+// working.
+func ParseDTPMode(s string) (DTPMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "auto":
+		return DTPAuto, nil
+	case "true", "on", "always":
+		return DTPAlways, nil
+	case "false", "off", "never":
+		return DTPNever, nil
+	}
+	return DTPAuto, fmt.Errorf("unknown mode %q: want auto, always or never", s)
+}
+
+func (m DTPMode) String() string {
+	switch m {
+	case DTPAlways:
+		return "always"
+	case DTPNever:
+		return "never"
+	}
+	return "auto"
+}
+
+// BackendHasDatetimePrecision reports whether a server calling itself version
+// has information_schema.COLUMNS.DATETIME_PRECISION, and whether the version
+// string was understood at all.
+//
+// The column arrived in MySQL 5.6 and, with the rest of fractional-second
+// support, in MariaDB 5.3. MariaDB also reports itself two ways: plainly, as
+// "10.11.2-MariaDB", and behind the compatibility prefix "5.5.5-" that exists
+// so clients too old to parse a 10.x version still see something they accept —
+// which would otherwise read as 5.5 and be badly wrong.
+//
+// An unrecognised version is reported as having the column. That direction
+// fails loudly: the metadata query comes back "Unknown column
+// 'DATETIME_PRECISION'", which is visible and fixable with -rewrite-datetime-
+// precision=always. Guessing the other way would silently report every
+// temporal column as having no fractional seconds.
+func BackendHasDatetimePrecision(version string) (has, recognised bool) {
+	v := strings.TrimPrefix(version, "5.5.5-") // MariaDB's compatibility prefix
+	major, minor, ok := majorMinor(v)
+	if !ok {
+		return true, false
+	}
+	if strings.Contains(strings.ToLower(v), "mariadb") {
+		return major > 5 || (major == 5 && minor >= 3), true
+	}
+	return major > 5 || (major == 5 && minor >= 6), true
+}
+
+// majorMinor reads the leading "<major>.<minor>" of a version string, ignoring
+// whatever follows: a patch level, a "-log" suffix, a vendor name.
+func majorMinor(v string) (major, minor int, ok bool) {
+	read := func(s string) (int, string, bool) {
+		i := 0
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			i++
+		}
+		if i == 0 || i > 4 {
+			return 0, s, false
+		}
+		n := 0
+		for _, c := range []byte(s[:i]) {
+			n = n*10 + int(c-'0')
+		}
+		return n, s[i:], true
+	}
+	major, rest, ok := read(v)
+	if !ok || rest == "" || rest[0] != '.' {
+		return 0, 0, false
+	}
+	minor, _, ok = read(rest[1:])
+	if !ok {
+		return 0, 0, false
+	}
+	return major, minor, true
 }
 
 // RewriteDatetimePrecision replaces the DATETIME_PRECISION column with the

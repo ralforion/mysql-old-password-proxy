@@ -98,6 +98,9 @@ type loginOpts struct {
 	db         string
 	extraCaps  uint32
 	plugin     string // sent as the client's chosen auth plugin
+	// capsOverride replaces the capabilities the client would otherwise accept
+	// from the relay's offer, for testing what a frugal client gets.
+	capsOverride uint32
 }
 
 // dial performs the client half of the connection phase and returns the
@@ -132,6 +135,9 @@ func dial(t *testing.T, addr string, o loginOpts) (*client, []byte) {
 
 	c.caps = (serverCaps & relay.FramingSafe) | mysqlwire.CapProtocol41 |
 		mysqlwire.CapSecureConnection | o.extraCaps
+	if o.capsOverride != 0 {
+		c.caps = o.capsOverride
+	}
 	if o.db == "" {
 		c.caps &^= mysqlwire.CapConnectWithDB
 	}
@@ -840,5 +846,108 @@ func TestReuseBackendPassword(t *testing.T) {
 	// Verification still happens: the same password, but still checked.
 	if _, p := dial(t, addr, loginOpts{user: legacyUser, pass: "wrong", db: "legacydb"}); !mysqlwire.IsErr(p) {
 		t.Error("the relay accepted a wrong password when reusing the backend one")
+	}
+}
+
+// TestDatetimePrecisionShimIsGatedOnVersion checks the shim follows the
+// backend's version rather than firing everywhere. The column arrived in MySQL
+// 5.6, so a 5.0 server needs the substitution and a 5.6 one must be left alone
+// — otherwise every temporal column with fractional seconds would report a
+// precision of 0 on a server that knows better.
+func TestDatetimePrecisionShimIsGatedOnVersion(t *testing.T) {
+	const query = "SELECT IF(DATETIME_PRECISION = 0, 19, 20) FROM information_schema.COLUMNS"
+
+	tests := []struct {
+		name    string
+		version string
+		mode    relay.DTPMode
+		want    string
+	}{
+		{"5.0 lacks the column", "5.0.96-fake", relay.DTPAuto,
+			"SELECT IF(0 = 0, 19, 20) FROM information_schema.COLUMNS"},
+		{"5.1 lacks the column", "5.1.73", relay.DTPAuto,
+			"SELECT IF(0 = 0, 19, 20) FROM information_schema.COLUMNS"},
+		{"5.5 lacks the column", "5.5.62-log", relay.DTPAuto,
+			"SELECT IF(0 = 0, 19, 20) FROM information_schema.COLUMNS"},
+		{"5.6 has it, leave it alone", "5.6.51", relay.DTPAuto, query},
+		{"8.0 has it", "8.0.36", relay.DTPAuto, query},
+		{"MariaDB behind its compatibility prefix has it", "5.5.5-10.11.2-MariaDB", relay.DTPAuto, query},
+		{"an unreadable version is left alone, so the failure is loud", "wat", relay.DTPAuto, query},
+		// The mode overrides the version either way.
+		{"always, on a server that has the column", "8.0.36", relay.DTPAlways,
+			"SELECT IF(0 = 0, 19, 20) FROM information_schema.COLUMNS"},
+		{"never, on a server that lacks it", "5.0.96-fake", relay.DTPNever, query},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			be := newFakeBackend(t, switchBare, caps50, legacyUser, legacyPass)
+			be.SetVersion(tc.version)
+			addr, _ := startRelay(t, be, func(c *relay.Config) { c.RewriteDTP = tc.mode })
+
+			c := mustDial(t, addr, loginOpts{user: frontUser, pass: frontPass, db: "legacydb"})
+			c.query(t, query)
+
+			got := be.LastSession(t).Queries()
+			if len(got) != 1 {
+				t.Fatalf("the backend saw %d queries, want 1", len(got))
+			}
+			if got[0] != tc.want {
+				t.Errorf("backend %q saw:\n %q\nwant:\n %q", tc.version, got[0], tc.want)
+			}
+		})
+	}
+}
+
+// TestSchemaQualifiedNamesWork is a regression test for CLIENT_NO_SCHEMA. That
+// capability changes no framing, so it sat in FramingSafe until a
+// schema-qualified query was tried: it tells the server to reject
+// database.table qualifiers, and every such query failed with the table
+// resolved against the default schema instead.
+func TestSchemaQualifiedNamesWork(t *testing.T) {
+	be := newFakeBackend(t, switchBare, caps50, legacyUser, legacyPass)
+	addr, _ := startRelay(t, be, nil)
+	c := mustDial(t, addr, loginOpts{user: frontUser, pass: frontPass, db: "legacydb"})
+
+	const q = "SELECT COLUMN_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = 'legacydb'"
+	if got := c.query(t, q); got != q {
+		t.Errorf("the backend saw %q", got)
+	}
+	if caps := be.LastSession(t).caps; caps&mysqlwire.CapNoSchema != 0 {
+		t.Errorf("the relay negotiated CLIENT_NO_SCHEMA with the backend (caps 0x%08x), "+
+			"which makes the server reject database.table qualifiers", caps)
+	}
+}
+
+// TestBackendSessionMirrorsClientCapabilities checks the relay opens a backend
+// session that behaves like the one the client thinks it has. A capability
+// negotiated on one half only changes what statements mean across the relay —
+// CLIENT_FOUND_ROWS would have an UPDATE report matched rows to one side and
+// changed rows to the other.
+func TestBackendSessionMirrorsClientCapabilities(t *testing.T) {
+	be := newFakeBackend(t, switchRequest, caps56, legacyUser, legacyPass)
+	addr, _ := startRelay(t, be, nil)
+
+	// A client that wants nothing beyond the minimum.
+	minimal := mysqlwire.CapProtocol41 | mysqlwire.CapSecureConnection
+	c, p := dial(t, addr, loginOpts{user: frontUser, pass: frontPass, capsOverride: minimal})
+	if !mysqlwire.IsOK(p) {
+		t.Fatalf("login failed: %s", mysqlwire.ErrText(p))
+	}
+	c.query(t, "SELECT 1")
+
+	got := be.LastSession(t).caps
+	if extra := got & relay.FramingSafe &^ minimal; extra != 0 {
+		t.Errorf("the relay negotiated 0x%08x with the backend that the client did not ask for", extra)
+	}
+
+	// And a client that takes everything on offer gets it end to end.
+	be2 := newFakeBackend(t, switchRequest, caps56, legacyUser, legacyPass)
+	addr2, _ := startRelay(t, be2, nil)
+	c2 := mustDial(t, addr2, loginOpts{user: frontUser, pass: frontPass, db: "legacydb"})
+	c2.query(t, "SELECT 1")
+
+	client2 := be2.LastSession(t).caps
+	if client2&mysqlwire.CapFoundRows == 0 {
+		t.Errorf("the backend session lost CLIENT_FOUND_ROWS the client negotiated (caps 0x%08x)", client2)
 	}
 }

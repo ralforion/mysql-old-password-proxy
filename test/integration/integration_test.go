@@ -106,6 +106,7 @@ func TestProxy(t *testing.T) {
 			t.Run("PreparedStatement", e.testPreparedStatement)
 			t.Run("Quit", e.testQuit)
 			t.Run("DangerousCapabilityIgnored", e.testDangerousCapabilityIgnored)
+			t.Run("DatetimePrecisionGate", e.testDatetimePrecisionGate)
 			t.Run("ConcurrentSessions", e.testConcurrentSessions)
 
 			// Destructive: these stop or restart the container, so they run last.
@@ -625,6 +626,16 @@ func (e *env) testTextQuery(t *testing.T) {
 		t.Errorf("rows = %d, want 3", len(rs.rows))
 	}
 
+	// Schema-qualified names must work. They did not while the relay
+	// negotiated CLIENT_NO_SCHEMA, which makes the server reject the
+	// database.table form and resolve the table against the default schema.
+	rs = c.query(t, "SELECT id FROM "+testDB+".widgets ORDER BY id")
+	if rs.errText != "" {
+		t.Errorf("a schema-qualified query failed: %s", rs.errText)
+	} else if len(rs.rows) != 3 {
+		t.Errorf("schema-qualified query returned %d rows, want 3", len(rs.rows))
+	}
+
 	// The session must be attached to the schema requested in the handshake.
 	rs = c.query(t, "SELECT DATABASE()")
 	if len(rs.rows) != 1 || !bytes.Contains(rs.rows[0], []byte(testDB)) {
@@ -820,6 +831,66 @@ func (e *env) testDangerousCapabilityIgnored(t *testing.T) {
 	}
 	if len(rs.rows) != 3 {
 		t.Errorf("rows = %d, want 3 — result-set framing did not stay EOF-terminated", len(rs.rows))
+	}
+}
+
+// testDatetimePrecisionGate exercises both sides of the version gate against
+// real servers. information_schema.COLUMNS.DATETIME_PRECISION arrived in MySQL
+// 5.6, so the two images differ exactly where it matters: on 5.5 the column
+// does not exist and the proxy must substitute 0 for it, while on 5.6 it does
+// and the proxy must keep its hands off, or every fractional-second column
+// would report a precision it does not have.
+func (e *env) testDatetimePrecisionGate(t *testing.T) {
+	c := e.mustDial(t, testDB)
+
+	// The shape MariaDB Connector/J 3.x sends from getColumns().
+	const query = "SELECT COLUMN_NAME, " +
+		"IF(DATETIME_PRECISION = 0, 19, CAST(20 + DATETIME_PRECISION AS signed integer)) AS COLUMN_SIZE " +
+		"FROM information_schema.COLUMNS " +
+		"WHERE TABLE_SCHEMA = '" + testDB + "' AND TABLE_NAME = 'widgets' ORDER BY ORDINAL_POSITION"
+
+	rs := c.query(t, query)
+	if rs.errText != "" {
+		t.Fatalf("the driver's metadata query failed: %s", rs.errText)
+	}
+	if len(rs.rows) != 3 {
+		t.Errorf("metadata rows = %d, want 3", len(rs.rows))
+	}
+
+	if e.image == "mysql:5.5" {
+		// Without the substitution this statement cannot even parse here.
+		if _, err := e.mysql("SELECT DATETIME_PRECISION FROM information_schema.COLUMNS LIMIT 1"); err == nil {
+			t.Fatal("mysql:5.5 appears to have DATETIME_PRECISION; this test is testing nothing")
+		}
+		return
+	}
+
+	// On a server that has the column, the proxy must report the true
+	// precision. A fractional-second column is the only way to tell the
+	// difference: DATETIME(3) is 23 wide, and 19 would mean the shim fired.
+	if _, err := e.mysql(fmt.Sprintf(
+		"CREATE TABLE %s.fractional (a DATETIME(3), b DATETIME)", testDB)); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	defer e.mysql(fmt.Sprintf("DROP TABLE %s.fractional", testDB))
+
+	rs = c.query(t, "SELECT COLUMN_NAME, "+
+		"IF(DATETIME_PRECISION = 0, 19, CAST(20 + DATETIME_PRECISION AS signed integer)) AS COLUMN_SIZE "+
+		"FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = '"+testDB+"' "+
+		"AND TABLE_NAME = 'fractional' ORDER BY ORDINAL_POSITION")
+	if rs.errText != "" {
+		t.Fatalf("metadata query: %s", rs.errText)
+	}
+	if len(rs.rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rs.rows))
+	}
+	// Text-protocol rows are length-prefixed strings; the sizes are enough to
+	// find without a full row parser.
+	if !bytes.Contains(rs.rows[0], []byte("23")) {
+		t.Errorf("DATETIME(3) reported %q, want a column size of 23 — the shim fired on a server that has the column", rs.rows[0])
+	}
+	if !bytes.Contains(rs.rows[1], []byte("19")) {
+		t.Errorf("DATETIME reported %q, want a column size of 19", rs.rows[1])
 	}
 }
 

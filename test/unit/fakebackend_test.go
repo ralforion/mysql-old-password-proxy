@@ -32,8 +32,23 @@ type fakeBackend struct {
 
 	mu       sync.Mutex
 	caps     uint32
+	version  string // what the greeting calls this server
 	sessions []*fakeSession
 	closed   bool
+}
+
+// Version returns the version string the greeting advertises.
+func (b *fakeBackend) Version() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.version
+}
+
+// SetVersion changes what the greeting advertises from the next connection on.
+func (b *fakeBackend) SetVersion(v string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.version = v
 }
 
 // Caps returns the capabilities the backend currently advertises.
@@ -105,7 +120,7 @@ func newFakeBackend(t *testing.T, style switchStyle, caps uint32, user, pass str
 	if err != nil {
 		t.Fatal(err)
 	}
-	b := &fakeBackend{ln: ln, caps: caps, user: user, pass: pass, switchStyle: style}
+	b := &fakeBackend{ln: ln, caps: caps, user: user, pass: pass, switchStyle: style, version: "5.0.96-fake"}
 	go b.serve(t)
 	t.Cleanup(b.Close)
 	return b
@@ -165,9 +180,9 @@ func (b *fakeBackend) handle(c net.Conn) error {
 	c.SetDeadline(time.Now().Add(30 * time.Second))
 	r := bufio.NewReader(c)
 
-	caps := b.Caps()
+	caps, version := b.Caps(), b.Version()
 	scramble := []byte("ABCDEFGHIJKLMNOPQRST")
-	if err := mysqlwire.WritePacket(c, b.greeting(caps, scramble), 0); err != nil {
+	if err := mysqlwire.WritePacket(c, b.greeting(caps, version, scramble), 0); err != nil {
 		return err
 	}
 
@@ -249,9 +264,10 @@ func (b *fakeBackend) checkOldPassword(got, scramble []byte) error {
 // greeting builds the Initial Handshake Packet in the shape MySQL 5.0 sends:
 // the capability low word, then thirteen zero filler bytes, then the rest of
 // the scramble — and no authentication plugin name.
-func (b *fakeBackend) greeting(caps uint32, scramble []byte) []byte {
+func (b *fakeBackend) greeting(caps uint32, version string, scramble []byte) []byte {
 	p := []byte{10}
-	p = append(p, "5.0.96-fake\x00"...)
+	p = append(p, version...)
+	p = append(p, 0)
 	p = append(p, 7, 0, 0, 0) // connection id
 	p = append(p, scramble[:8]...)
 	p = append(p, 0)                         // filler

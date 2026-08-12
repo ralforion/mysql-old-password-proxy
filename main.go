@@ -82,14 +82,15 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
 	var (
-		listenAddr    = flag.String("listen", ":3306", "address to listen on for clients")
-		healthAddr    = flag.String("health-addr", ":8081", "address for the HTTP health endpoint (empty disables it)")
-		backendAddr   = flag.String("backend", "", "legacy MySQL server host:port (required)")
-		backendUser   = flag.String("backend-user", "", "username on the legacy server (required)")
-		frontendUsr   = flag.String("frontend-user", "", "username clients must present (defaults to -backend-user)")
-		serverVer     = flag.String("server-version", "5.5.62-auth-relay", "version string advertised to clients")
-		rewriteMB4    = flag.Bool("rewrite-utf8mb4", true, "rewrite utf8mb4 to utf8 in queries (MySQL 5.0 has no utf8mb4)")
-		rewriteDTP    = flag.Bool("rewrite-datetime-precision", true, "replace DATETIME_PRECISION with 0 in information_schema queries (the column arrived in MySQL 5.6; without this, reading column metadata fails on 5.0/5.1)")
+		listenAddr  = flag.String("listen", ":3306", "address to listen on for clients")
+		healthAddr  = flag.String("health-addr", ":8081", "address for the HTTP health endpoint (empty disables it)")
+		backendAddr = flag.String("backend", "", "legacy MySQL server host:port (required)")
+		backendUser = flag.String("backend-user", "", "username on the legacy server (required)")
+		frontendUsr = flag.String("frontend-user", "", "username clients must present (defaults to -backend-user)")
+		serverVer   = flag.String("server-version", "5.5.62-auth-relay", "version string advertised to clients")
+		rewriteMB4  = flag.Bool("rewrite-utf8mb4", true, "rewrite utf8mb4 to utf8 in queries (MySQL 5.0 has no utf8mb4)")
+		rewriteDTP  = flag.String("rewrite-datetime-precision", "auto",
+			"replace DATETIME_PRECISION with 0 in information_schema queries: auto (only when the backend predates the column, which arrived in MySQL 5.6 and MariaDB 5.3), always, or never")
 		fakeOKRe      = flag.String("fake-ok-regex", "", "regexp; matching COM_QUERY statements are answered OK without reaching the backend")
 		logQueries    = flag.Bool("log-queries", false, "log every COM_QUERY (verbose; may expose data)")
 		dialTimeout   = flag.Duration("dial-timeout", 10*time.Second, "timeout for connecting to the backend")
@@ -109,6 +110,11 @@ func main() {
 		return
 	}
 
+	dtpMode, err := relay.ParseDTPMode(*rewriteDTP)
+	if err != nil {
+		log.Fatalf("-rewrite-datetime-precision: %v", err)
+	}
+
 	cfg := relay.Config{
 		Backend:     *backendAddr,
 		BackendUser: *backendUser,
@@ -119,7 +125,7 @@ func main() {
 		FrontendPass:   os.Getenv("MYSQL_RELAY_FRONTEND_PASSWORD"),
 		ServerVersion:  *serverVer,
 		RewriteUTF8MB4: *rewriteMB4,
-		RewriteDTP:     *rewriteDTP,
+		RewriteDTP:     dtpMode,
 		LogQueries:     *logQueries,
 		DialTimeout:    *dialTimeout,
 		AuthTimeout:    *authTimeout,

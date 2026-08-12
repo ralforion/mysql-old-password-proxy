@@ -59,7 +59,16 @@ Never offered: `CLIENT_DEPRECATE_EOF`, `CLIENT_SESSION_TRACK`,
 `CLIENT_QUERY_ATTRIBUTES`, `CLIENT_OPTIONAL_RESULTSET_METADATA` (framing),
 `CLIENT_COMPRESS`, `CLIENT_ZSTD_COMPRESSION_ALGORITHM` (would need re-framing),
 `CLIENT_SSL` (see [Security](#security)), `CLIENT_LOCAL_FILES` (turns the server
-into a file-read request against the client).
+into a file-read request against the client), and `CLIENT_NO_SCHEMA` — which
+changes no framing at all, but makes the server reject `database.table`
+qualifiers, so carrying it breaks every schema-qualified query. Framing is not
+the only way a capability can be unsafe to relay.
+
+What the relay negotiates with the legacy server is what the *client*
+negotiated, not the whole set: a capability enabled on one half only would make
+statements mean different things on the two sides. `CLIENT_FOUND_ROWS` is the
+plain example — an `UPDATE` would report matched rows to one side and changed
+rows to the other.
 
 Clients routinely *claim* flags the server never advertised — the mysql 8.0
 client sends `CLIENT_DEPRECATE_EOF`, `CLIENT_SESSION_TRACK` and
@@ -92,14 +101,24 @@ regexp checks on `COM_QUERY` payloads.
   predates `utf8mb4` (added in 5.5) and drivers issue `SET NAMES utf8mb4`. It is
   a blunt replacement: a query carrying that literal *in data* is rewritten too.
   The same mapping is applied to the character set in the handshake.
-- **`-rewrite-datetime-precision`** (default on) replaces the
+- **`-rewrite-datetime-precision`** (default `auto`) replaces the
   `DATETIME_PRECISION` column with the literal `0` in `information_schema`
-  queries. That column arrived in MySQL 5.6, so without this, reading column
-  metadata from a 5.0 or 5.1 server fails outright:
+  queries, but only when the backend predates the column. That column arrived
+  in MySQL 5.6 and in MariaDB 5.3, so without this, reading column metadata
+  from a 5.0 or 5.1 server fails outright:
 
   ```
   Unknown column 'DATETIME_PRECISION' in 'field list'
   ```
+
+  The gate matters in both directions. Against a server that *has* the column,
+  substituting 0 would report every fractional-second column as having none:
+  a `DATETIME(3)` would come back 19 wide instead of 23. So `auto` reads the
+  version from the backend's handshake and only rewrites where it must —
+  MySQL 5.5 is rewritten, MySQL 5.6 is not, and MariaDB is recognised behind
+  the `5.5.5-` compatibility prefix it puts in front of its real version. A
+  version string it cannot parse is left alone, so the failure is a loud
+  `Unknown column` rather than quietly wrong metadata; `always` forces it.
 
   MariaDB Connector/J 3.x uses it in `DatabaseMetaData.getColumns()` to size
   temporal columns — `IF(DATETIME_PRECISION = 0, 19, CAST(20 + DATETIME_PRECISION
@@ -132,7 +151,7 @@ statements larger than 16 MB, which the protocol splits across packets.
 | `-frontend-user` | `-backend-user` | username clients must present |
 | `-server-version` | `5.5.62-auth-relay` | version string advertised to clients |
 | `-rewrite-utf8mb4` | `true` | rewrite `utf8mb4` to `utf8` |
-| `-rewrite-datetime-precision` | `true` | replace `DATETIME_PRECISION` with `0` in `information_schema` queries (the column arrived in 5.6) |
+| `-rewrite-datetime-precision` | `auto` | substitute `DATETIME_PRECISION` in `information_schema` queries: `auto`, `always` or `never` |
 | `-fake-ok-regex` | *empty* | statements answered OK without reaching the backend |
 | `-log-queries` | `false` | log every `COM_QUERY` (verbose; may expose data) |
 | `-max-connections` | `0` | cap on concurrent sessions, each holding one backend connection (0 = unlimited) |

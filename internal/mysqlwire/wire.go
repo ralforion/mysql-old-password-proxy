@@ -241,6 +241,27 @@ func ParseServerHandshake(p []byte) (caps uint32, scramble []byte, err error) {
 	return caps, scramble, nil
 }
 
+// ParseServerVersion returns the version string from an Initial Handshake
+// Packet, or "" if the packet is not one. It is separate from
+// ParseServerHandshake because the version matters only to callers deciding
+// what a particular server supports, whereas the capabilities and scramble are
+// needed to authenticate at all.
+//
+// The string is whatever the server chose to call itself, including any suffix:
+// "5.0.77", "5.6.51-log", or MariaDB's compatibility form
+// "5.5.5-10.11.2-MariaDB". Interpreting it is the caller's problem.
+func ParseServerVersion(p []byte) string {
+	if len(p) < 2 || p[0] != protocolVer10 {
+		return ""
+	}
+	for i := 1; i < len(p); i++ {
+		if p[i] == 0 {
+			return string(p[1:i])
+		}
+	}
+	return ""
+}
+
 // BuildServerHandshake builds the Initial Handshake Packet the relay sends to
 // its own clients. It always names mysql_native_password.
 func BuildServerHandshake(version string, connID, caps uint32, scramble []byte) []byte {

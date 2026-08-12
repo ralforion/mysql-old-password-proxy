@@ -298,3 +298,82 @@ func TestConfigDefaults(t *testing.T) {
 		t.Error("backend capabilities must start out unknown")
 	}
 }
+
+// ------------------------------------------------- DATETIME_PRECISION gate ---
+
+// TestBackendHasDatetimePrecision pins which servers the shim applies to.
+// information_schema.COLUMNS.DATETIME_PRECISION arrived in MySQL 5.6 and, with
+// the rest of fractional-second support, in MariaDB 5.3.
+func TestBackendHasDatetimePrecision(t *testing.T) {
+	tests := []struct {
+		version         string
+		has, recognised bool
+	}{
+		// The servers this proxy exists for.
+		{"5.0.77", false, true},
+		{"5.0.96-community", false, true},
+		{"5.1.73", false, true},
+		{"5.5.62", false, true},
+		{"5.5.62-log", false, true},
+		// MySQL from 5.6 on has the column.
+		{"5.6.51", true, true},
+		{"5.6.51-log", true, true},
+		{"5.7.44", true, true},
+		{"8.0.36", true, true},
+		{"8.4.0", true, true},
+		{"9.1.0", true, true},
+		// MariaDB reports itself two ways. The "5.5.5-" prefix is a
+		// compatibility marker, not a version: read literally it would make
+		// 10.11 look like 5.5 and wrongly trigger the shim.
+		{"10.11.2-MariaDB", true, true},
+		{"5.5.5-10.11.2-MariaDB", true, true},
+		{"5.5.5-10.6.12-MariaDB-1:10.6.12+maria~ubu2004", true, true},
+		{"5.3.12-MariaDB", true, true},
+		{"5.2.14-MariaDB", false, true},
+		{"5.1.67-MariaDB", false, true},
+		// Anything unreadable is reported as having the column, so the failure
+		// is a loud "Unknown column" rather than silently wrong metadata.
+		{"", true, false},
+		{"not-a-version", true, false},
+		{"5", true, false},
+		{"5.x", true, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.version, func(t *testing.T) {
+			has, recognised := relay.BackendHasDatetimePrecision(tc.version)
+			if has != tc.has || recognised != tc.recognised {
+				t.Errorf("BackendHasDatetimePrecision(%q) = (%v, %v), want (%v, %v)",
+					tc.version, has, recognised, tc.has, tc.recognised)
+			}
+		})
+	}
+}
+
+func TestParseDTPMode(t *testing.T) {
+	for in, want := range map[string]relay.DTPMode{
+		"":       relay.DTPAuto,
+		"auto":   relay.DTPAuto,
+		"AUTO":   relay.DTPAuto,
+		" auto ": relay.DTPAuto,
+		"always": relay.DTPAlways,
+		"on":     relay.DTPAlways,
+		"never":  relay.DTPNever,
+		"off":    relay.DTPNever,
+		// The flag was a boolean before the version gate existed; both spellings
+		// keep working, and mean what they used to.
+		"true":  relay.DTPAlways,
+		"false": relay.DTPNever,
+	} {
+		got, err := relay.ParseDTPMode(in)
+		if err != nil {
+			t.Errorf("ParseDTPMode(%q): %v", in, err)
+			continue
+		}
+		if got != want {
+			t.Errorf("ParseDTPMode(%q) = %v, want %v", in, got, want)
+		}
+	}
+	if _, err := relay.ParseDTPMode("sometimes"); err == nil {
+		t.Error("an unknown mode must be rejected")
+	}
+}
