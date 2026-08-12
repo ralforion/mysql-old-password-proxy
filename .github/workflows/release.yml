@@ -50,6 +50,8 @@ jobs:
     name: Build and push
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # to create the GitHub release for a tag
     steps:
       - uses: actions/checkout@v7
         with:
@@ -129,6 +131,72 @@ jobs:
           repository: ${{ env.IMAGE }}
           readme-filepath: ./docs/DOCKERHUB.md
           short-description: "Lets modern MySQL clients reach a legacy server that only accepts pre-4.1 authentication"
+
+      # The tag alone says nothing about what changed. CHANGELOG.md is the
+      # written account, so the notes come from its section for this version;
+      # the commit subjects are the fallback when a release predates an entry.
+      - name: Create the GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          previous=$(git tag --sort=-version:refname | grep -v "^$TAG$" | head -1 || true)
+
+          {
+            echo "## Image"
+            echo
+            echo '```sh'
+            echo "docker pull ${{ env.IMAGE }}:$version"
+            echo '```'
+            echo
+            echo "\`linux/amd64\` and \`linux/arm64\`, a single static binary on \`scratch\`."
+            echo
+            echo "\`\`\`"
+            echo "digest: $DIGEST"
+            echo "\`\`\`"
+            echo
+
+            # Everything between this version's heading and the next one.
+            notes=$(awk -v v="$version" '
+              $0 ~ "^## \\[" v "\\]" { found = 1; next }
+              found && /^## \[/        { exit }
+              found                      { print }
+            ' CHANGELOG.md | sed -e '/./,$!d')
+
+            if [ -n "$notes" ]; then
+              echo "$notes"
+            else
+              echo "## Changes"
+              echo
+              if [ -n "$previous" ]; then
+                git log --no-merges --pretty=format:'- %s' "$previous..$TAG"
+                echo
+              else
+                git log --no-merges --pretty=format:'- %s' "$TAG"
+                echo
+              fi
+            fi
+
+            if [ -n "$previous" ]; then
+              echo
+              echo "**Full diff**: https://github.com/${{ github.repository }}/compare/$previous...$TAG"
+            fi
+          } > notes.md
+
+          echo "--- release notes ---"
+          cat notes.md
+
+          # Re-running a release updates the notes rather than failing on a
+          # release that already exists.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" --title "$TAG" --notes-file notes.md --verify-tag
+          fi
 
       - name: Summary
         run: |

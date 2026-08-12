@@ -342,7 +342,9 @@ go test -tags integration -v -timeout 40m ./test/integration/...
 
 ## Releasing
 
-Images are published to Docker Hub by GitHub Actions.
+Images are published to Docker Hub by GitHub Actions. What changed in each one
+is in [CHANGELOG.md](CHANGELOG.md), which the release workflow also uses as the
+GitHub release notes.
 
 | Trigger | Tags |
 |---|---|
