@@ -1,6 +1,7 @@
 package unit
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/ralforion/mysql-old-password-proxy/internal/mysqlwire"
@@ -158,6 +159,75 @@ func TestRewriteUTF8MB4NonASCII(t *testing.T) {
 	want := "SET NAMES utf8 /* Grüße, 日本語 */"
 	if got := relay.RewriteUTF8MB4(in); got != want {
 		t.Errorf("RewriteUTF8MB4 mangled non-ASCII: %q", got)
+	}
+}
+
+func TestRewriteDatetimePrecision(t *testing.T) {
+	tests := []struct {
+		name, in, want string
+	}{
+		{
+			// The shape MariaDB Connector/J 3.x sends from getColumns().
+			name: "connector/j getColumns expression",
+			in:   "SELECT x FROM INFORMATION_SCHEMA.COLUMNS WHERE IF(DATETIME_PRECISION = 0, 19, CAST(20 + DATETIME_PRECISION as signed integer))",
+			want: "SELECT x FROM INFORMATION_SCHEMA.COLUMNS WHERE IF(0 = 0, 19, CAST(20 + 0 as signed integer))",
+		},
+		{
+			name: "lowercase table and column",
+			in:   "select datetime_precision from information_schema.columns",
+			want: "select 0 from information_schema.columns",
+		},
+		{
+			name: "cast form",
+			in:   "SELECT CAST(DATETIME_PRECISION as signed integer) FROM information_schema.COLUMNS",
+			want: "SELECT CAST(0 as signed integer) FROM information_schema.COLUMNS",
+		},
+		{
+			// Scoped to information_schema: an application table keeping a
+			// column of that name is none of the proxy's business.
+			name: "untouched outside information_schema",
+			in:   "SELECT DATETIME_PRECISION FROM my_metadata_table",
+			want: "SELECT DATETIME_PRECISION FROM my_metadata_table",
+		},
+		{
+			name: "identifier boundary, longer name",
+			in:   "SELECT MY_DATETIME_PRECISION_X FROM information_schema.COLUMNS",
+			want: "SELECT MY_DATETIME_PRECISION_X FROM information_schema.COLUMNS",
+		},
+		{
+			// A quoted identifier must not become `0`, which names a column "0".
+			name: "backtick quoted left alone",
+			in:   "SELECT `DATETIME_PRECISION` FROM information_schema.COLUMNS",
+			want: "SELECT `DATETIME_PRECISION` FROM information_schema.COLUMNS",
+		},
+		{
+			name: "no column present",
+			in:   "SELECT TABLE_NAME FROM information_schema.TABLES",
+			want: "SELECT TABLE_NAME FROM information_schema.TABLES",
+		},
+		{name: "empty", in: "", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := relay.RewriteDatetimePrecision(tc.in); got != tc.want {
+				t.Errorf("RewriteDatetimePrecision(%q)\n got %q\nwant %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRewriteDatetimePrecisionSubstitutesZeroNotNull pins the choice of 0 over
+// NULL. The driver computes column sizes arithmetically from this value, so
+// NULL would propagate through the comparison and the CAST and every temporal
+// column would report a NULL size — a subtler failure than the one being fixed.
+func TestRewriteDatetimePrecisionSubstitutesZeroNotNull(t *testing.T) {
+	in := "SELECT IF(DATETIME_PRECISION = 0, 19, 20) FROM information_schema.COLUMNS"
+	got := relay.RewriteDatetimePrecision(in)
+	if strings.Contains(strings.ToUpper(got), "NULL") {
+		t.Errorf("substituted NULL, want 0: %q", got)
+	}
+	if !strings.Contains(got, "IF(0 = 0, 19, 20)") {
+		t.Errorf("got %q, want the literal 0 substituted", got)
 	}
 }
 

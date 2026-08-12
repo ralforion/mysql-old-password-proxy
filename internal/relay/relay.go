@@ -91,6 +91,7 @@ type Config struct {
 
 	ServerVersion  string         // version string advertised to clients
 	RewriteUTF8MB4 bool           // rewrite utf8mb4 to utf8 in COM_QUERY
+	RewriteDTP     bool           // replace DATETIME_PRECISION with 0 in information_schema queries
 	FakeOK         *regexp.Regexp // statements answered OK without reaching the backend
 	LogQueries     bool
 
@@ -637,6 +638,12 @@ func (s *Server) clientToBackend(client *frontendConn, backend *backendConn) err
 					payload = append([]byte{mysqlwire.ComQuery}, q...)
 				}
 			}
+			if s.cfg.RewriteDTP {
+				if nq := RewriteDatetimePrecision(q); nq != q {
+					q = nq
+					payload = append([]byte{mysqlwire.ComQuery}, q...)
+				}
+			}
 			if s.cfg.FakeOK != nil && s.cfg.FakeOK.MatchString(q) {
 				s.cfg.Logger.Printf("conn %d: answering OK without forwarding: %s", client.id, truncate(q, 200))
 				if err := mysqlwire.WritePacket(client.Conn, mysqlwire.OKPacket(), seq+1); err != nil {
@@ -691,6 +698,61 @@ func RewriteUTF8MB4(q string) string {
 		i++
 	}
 	return b.String()
+}
+
+// RewriteDatetimePrecision replaces the DATETIME_PRECISION column with the
+// literal 0 in information_schema queries. That column arrived in MySQL 5.6, so
+// on 5.0 and 5.1 every driver that reads column metadata fails outright:
+//
+//	Unknown column 'DATETIME_PRECISION' in 'field list'
+//
+// MariaDB Connector/J 3.x uses it in DatabaseMetaData.getColumns() (and three
+// other metadata methods) to size temporal columns:
+//
+//	IF(DATETIME_PRECISION = 0, 19, CAST(20 + DATETIME_PRECISION as signed integer))
+//
+// so the substitution has to be 0, not NULL. Zero is also the truthful answer —
+// a server without fractional seconds has precision 0 — and it keeps the
+// arithmetic intact: NULL would poison the comparison and the CAST, and every
+// temporal column would come back with a NULL size.
+//
+// Two things keep this narrow. It only fires on statements that mention
+// information_schema, so an application column of the same name is untouched;
+// and the match respects identifier boundaries, so MY_DATETIME_PRECISION and a
+// backtick-quoted `DATETIME_PRECISION` are both left alone.
+func RewriteDatetimePrecision(q string) string {
+	const needle = "datetime_precision"
+	lower := strings.ToLower(q)
+	if !strings.Contains(lower, "information_schema") || !strings.Contains(lower, needle) {
+		return q
+	}
+	var b strings.Builder
+	b.Grow(len(q))
+	for i := 0; i < len(q); {
+		if strings.HasPrefix(lower[i:], needle) &&
+			(i == 0 || !isIdentByte(q[i-1])) &&
+			(i+len(needle) == len(q) || !isIdentByte(q[i+len(needle)])) {
+			b.WriteByte('0')
+			i += len(needle)
+			continue
+		}
+		b.WriteByte(q[i])
+		i++
+	}
+	return b.String()
+}
+
+// isIdentByte reports whether b can appear inside a MySQL identifier. The
+// backtick counts: it means the identifier was quoted, and a quoted
+// `DATETIME_PRECISION` must not become `0`, which would name a column "0".
+func isIdentByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	case b == '_', b == '$', b == '`':
+		return true
+	}
+	return false
 }
 
 func truncate(s string, n int) string {

@@ -83,15 +83,37 @@ so a backend failure still surfaces as a clean error at connect time rather than
 a hang. Backend capabilities come from a probe made at startup, which also
 validates the credentials in your Secret at boot instead of on the first query.
 
-### The two places SQL is touched
+### The three places SQL is touched
 
-Both are optional and both are off the SQL parser path — they are substring and
+All are optional and all are off the SQL parser path — they are substring and
 regexp checks on `COM_QUERY` payloads.
 
 - **`-rewrite-utf8mb4`** (default on) rewrites `utf8mb4` → `utf8`. MySQL 5.0
   predates `utf8mb4` (added in 5.5) and drivers issue `SET NAMES utf8mb4`. It is
   a blunt replacement: a query carrying that literal *in data* is rewritten too.
   The same mapping is applied to the character set in the handshake.
+- **`-rewrite-datetime-precision`** (default on) replaces the
+  `DATETIME_PRECISION` column with the literal `0` in `information_schema`
+  queries. That column arrived in MySQL 5.6, so without this, reading column
+  metadata from a 5.0 or 5.1 server fails outright:
+
+  ```
+  Unknown column 'DATETIME_PRECISION' in 'field list'
+  ```
+
+  MariaDB Connector/J 3.x uses it in `DatabaseMetaData.getColumns()` to size
+  temporal columns — `IF(DATETIME_PRECISION = 0, 19, CAST(20 + DATETIME_PRECISION
+  as signed integer))` — so the substitution must be `0`, not `NULL`: `NULL`
+  would poison the comparison and the arithmetic, and every temporal column
+  would come back with a `NULL` size. Zero is also the truthful answer, since a
+  server without fractional seconds has precision 0. Unlike the `utf8mb4`
+  rewrite this one is narrow: it only fires on statements mentioning
+  `information_schema`, and it respects identifier boundaries, so
+  `MY_DATETIME_PRECISION_X` and a backtick-quoted `` `DATETIME_PRECISION` ``
+  are left alone.
+
+  Without it the proxy authenticates but no JDBC client can read a schema —
+  which is most of the point.
 - **`-fake-ok-regex`** (default off) answers matching statements with an OK
   packet without forwarding them. This is the escape hatch for driver session
   setup a legacy server rejects outright — `SET session_track_schema=1` and
@@ -110,6 +132,7 @@ statements larger than 16 MB, which the protocol splits across packets.
 | `-frontend-user` | `-backend-user` | username clients must present |
 | `-server-version` | `5.5.62-auth-relay` | version string advertised to clients |
 | `-rewrite-utf8mb4` | `true` | rewrite `utf8mb4` to `utf8` |
+| `-rewrite-datetime-precision` | `true` | replace `DATETIME_PRECISION` with `0` in `information_schema` queries (the column arrived in 5.6) |
 | `-fake-ok-regex` | *empty* | statements answered OK without reaching the backend |
 | `-log-queries` | `false` | log every `COM_QUERY` (verbose; may expose data) |
 | `-max-connections` | `0` | cap on concurrent sessions, each holding one backend connection (0 = unlimited) |
@@ -346,6 +369,11 @@ the VCS revision the Go toolchain embeds.
 - No compression (`CLIENT_COMPRESS` is deliberately never negotiated).
 - One backend per process. Two legacy servers means two deployments.
 - `-rewrite-utf8mb4` also rewrites the literal `utf8mb4` inside query data.
+- The `information_schema` shim covers `DATETIME_PRECISION` only. It is the sole
+  column MariaDB Connector/J 3.x's `getColumns()` needs that MySQL 5.0 lacks,
+  but another driver, or another metadata call, may reach for something else
+  — `GENERATION_EXPRESSION` (5.7) and `SRS_ID` (8.0) are the likely candidates.
+  Find them with `-log-queries`.
 - Statements over 16 MB are relayed but not inspected past their first chunk,
   so no rewrite applies to them.
 

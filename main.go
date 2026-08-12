@@ -89,6 +89,7 @@ func main() {
 		frontendUsr   = flag.String("frontend-user", "", "username clients must present (defaults to -backend-user)")
 		serverVer     = flag.String("server-version", "5.5.62-auth-relay", "version string advertised to clients")
 		rewriteMB4    = flag.Bool("rewrite-utf8mb4", true, "rewrite utf8mb4 to utf8 in queries (MySQL 5.0 has no utf8mb4)")
+		rewriteDTP    = flag.Bool("rewrite-datetime-precision", true, "replace DATETIME_PRECISION with 0 in information_schema queries (the column arrived in MySQL 5.6; without this, reading column metadata fails on 5.0/5.1)")
 		fakeOKRe      = flag.String("fake-ok-regex", "", "regexp; matching COM_QUERY statements are answered OK without reaching the backend")
 		logQueries    = flag.Bool("log-queries", false, "log every COM_QUERY (verbose; may expose data)")
 		dialTimeout   = flag.Duration("dial-timeout", 10*time.Second, "timeout for connecting to the backend")
@@ -118,6 +119,7 @@ func main() {
 		FrontendPass:   os.Getenv("MYSQL_RELAY_FRONTEND_PASSWORD"),
 		ServerVersion:  *serverVer,
 		RewriteUTF8MB4: *rewriteMB4,
+		RewriteDTP:     *rewriteDTP,
 		LogQueries:     *logQueries,
 		DialTimeout:    *dialTimeout,
 		AuthTimeout:    *authTimeout,
