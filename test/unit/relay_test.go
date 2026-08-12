@@ -377,3 +377,80 @@ func TestParseDTPMode(t *testing.T) {
 		t.Error("an unknown mode must be rejected")
 	}
 }
+
+// TestRewriteUTF8MB4Collations covers the collation suffix, which cannot simply
+// be renamed: utf8mb4 has collations utf8 never had, and utf8_0900_ai_ci is not
+// a collation on any server.
+func TestRewriteUTF8MB4Collations(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		// Suffixes the old utf8 character set really has are carried across.
+		{"unicode_ci", "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
+			"SET NAMES utf8 COLLATE utf8_unicode_ci"},
+		{"general_ci", "SET NAMES utf8mb4 COLLATE utf8mb4_general_ci",
+			"SET NAMES utf8 COLLATE utf8_general_ci"},
+		{"bin", "SET NAMES utf8mb4 COLLATE utf8mb4_bin", "SET NAMES utf8 COLLATE utf8_bin"},
+		{"a language collation", "SET NAMES utf8mb4 COLLATE utf8mb4_turkish_ci",
+			"SET NAMES utf8 COLLATE utf8_turkish_ci"},
+
+		// Anything else becomes utf8_general_ci. Renaming would invent a
+		// collation that has never existed and the server would refuse it.
+		{"MySQL 8.0 default", "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+			"SET NAMES utf8 COLLATE utf8_general_ci"},
+		{"MySQL 8.0 case sensitive", "SET NAMES utf8mb4 COLLATE utf8mb4_0900_as_cs",
+			"SET NAMES utf8 COLLATE utf8_general_ci"},
+		{"MariaDB 11 UCA", "SET NAMES utf8mb4 COLLATE utf8mb4_uca1400_ai_ci",
+			"SET NAMES utf8 COLLATE utf8_general_ci"},
+		{"unicode_520_ci, added after 5.0", "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_520_ci",
+			"SET NAMES utf8 COLLATE utf8_general_ci"},
+		{"a session variable", "SET collation_connection = utf8mb4_0900_ai_ci",
+			"SET collation_connection = utf8_general_ci"},
+
+		// A bare charset name has no suffix to consider.
+		{"bare", "SET NAMES utf8mb4", "SET NAMES utf8"},
+		{"in CONVERT", "SELECT CONVERT('x' USING utf8mb4)", "SELECT CONVERT('x' USING utf8)"},
+		{"followed by punctuation", "SET NAMES utf8mb4;", "SET NAMES utf8;"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := relay.RewriteUTF8MB4(tc.in); got != tc.want {
+				t.Errorf("RewriteUTF8MB4(%q) =\n %q\nwant\n %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRewritesSurviveUnicode guards both rewrites against a folding bug that
+// used to panic the process. strings.ToLower changes byte lengths — U+212A
+// KELVIN SIGN is three bytes and lowercases to a one-byte "k" — so indexing the
+// original query with offsets from a folded copy read out of bounds.
+func TestRewritesSurviveUnicode(t *testing.T) {
+	runes := []string{
+		"K",     // KELVIN SIGN, folds shorter
+		"İ",     // LATIN CAPITAL I WITH DOT ABOVE, folds longer
+		"ẞ",     // LATIN CAPITAL SHARP S
+		"日本語",   // no case at all
+		"Grüße", // ordinary accented text
+		"АБ",    // Cyrillic
+	}
+	for _, r := range runes {
+		t.Run(r, func(t *testing.T) {
+			pad := strings.Repeat(r, 40)
+			for _, q := range []string{
+				"SET NAMES utf8mb4 /* " + pad + " */",
+				"/* " + pad + " */ SET NAMES utf8mb4",
+				"SELECT '" + pad + "' FROM information_schema.COLUMNS WHERE DATETIME_PRECISION > 0",
+				pad + "utf8mb4" + pad,
+			} {
+				// The result is not what is being checked here; not panicking,
+				// and not corrupting the surrounding text, is.
+				got := relay.RewriteUTF8MB4(q)
+				if !strings.Contains(got, pad) {
+					t.Errorf("RewriteUTF8MB4 damaged the surrounding text: %q", got)
+				}
+				if got := relay.RewriteDatetimePrecision(q); !strings.Contains(got, pad) {
+					t.Errorf("RewriteDatetimePrecision damaged the surrounding text: %q", got)
+				}
+			}
+		})
+	}
+}

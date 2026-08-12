@@ -730,6 +730,25 @@ var copyBufPool = sync.Pool{
 	},
 }
 
+// asciiFold lowercases the ASCII letters in q and leaves every other byte
+// exactly as it is, so the result is always the same length as the input.
+//
+// strings.ToLower cannot be used for this. It folds by Unicode rules, which
+// change byte lengths: U+212A KELVIN SIGN is three bytes and lowercases to a
+// one-byte "k". Indexing the original query with offsets taken from a folded
+// copy then reads out of bounds — a query mixing such a rune with a rewrite
+// trigger used to panic the process. The keywords being matched are ASCII, so
+// ASCII folding loses nothing.
+func asciiFold(q string) string {
+	b := []byte(q)
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
 // RewriteUTF8MB4 downgrades utf8mb4 to utf8. MySQL 5.0 predates utf8mb4 (added
 // in 5.5), and modern drivers issue session setup such as "SET NAMES utf8mb4"
 // that such a server rejects outright.
@@ -739,7 +758,7 @@ var copyBufPool = sync.Pool{
 // the workload.
 func RewriteUTF8MB4(q string) string {
 	const needle = "utf8mb4"
-	lower := strings.ToLower(q)
+	lower := asciiFold(q)
 	if !strings.Contains(lower, needle) {
 		return q
 	}
@@ -747,14 +766,66 @@ func RewriteUTF8MB4(q string) string {
 	b.Grow(len(q))
 	for i := 0; i < len(q); {
 		if strings.HasPrefix(lower[i:], needle) {
-			b.WriteString("utf8")
 			i += len(needle)
+			// A collation suffix has to be checked, not just renamed: utf8mb4
+			// gained collations that utf8 never had, and utf8_0900_ai_ci does
+			// not exist on any server.
+			if suffix, next, ok := collationSuffix(lower, i); ok {
+				if utf8mb3Collations[suffix] {
+					b.WriteString("utf8") // the suffix is copied as it stands
+				} else {
+					b.WriteString("utf8_general_ci")
+					i = next
+				}
+				continue
+			}
+			b.WriteString("utf8")
 			continue
 		}
 		b.WriteByte(q[i])
 		i++
 	}
 	return b.String()
+}
+
+// collationSuffix reads the "_general_ci" part following a charset name in the
+// already-folded lower, starting at i. ok is false when what follows is not a
+// collation suffix at all — a bare "utf8mb4" in SET NAMES, say.
+func collationSuffix(lower string, i int) (suffix string, next int, ok bool) {
+	if i >= len(lower) || lower[i] != '_' {
+		return "", i, false
+	}
+	j := i + 1
+	for j < len(lower) && (lower[j] == '_' ||
+		(lower[j] >= 'a' && lower[j] <= 'z') ||
+		(lower[j] >= '0' && lower[j] <= '9')) {
+		j++
+	}
+	if j == i+1 {
+		return "", i, false
+	}
+	return lower[i+1 : j], j, true
+}
+
+// utf8mb3Collations are the collations the old utf8 character set actually has,
+// measured on MySQL 5.5 — minus sinhala_ci and general_mysql500_ci, which
+// arrived in 5.5 and 5.1 and so cannot be assumed on the 5.0 servers this proxy
+// is aimed at.
+//
+// A utf8mb4 collation outside this set is mapped to utf8_general_ci rather than
+// renamed. The renaming is what a plain substitution would do, and it invents
+// collations that have never existed: utf8mb4_0900_ai_ci, the default in MySQL
+// 8.0, would become utf8_0900_ai_ci and be rejected outright. Substituting a
+// collation the server does have changes sort order for the session, which is a
+// smaller cost than a connection that cannot be opened.
+var utf8mb3Collations = map[string]bool{
+	"general_ci": true, "bin": true, "unicode_ci": true,
+	"czech_ci": true, "danish_ci": true, "esperanto_ci": true,
+	"estonian_ci": true, "hungarian_ci": true, "icelandic_ci": true,
+	"latvian_ci": true, "lithuanian_ci": true, "persian_ci": true,
+	"polish_ci": true, "romanian_ci": true, "roman_ci": true,
+	"slovak_ci": true, "slovenian_ci": true, "spanish2_ci": true,
+	"spanish_ci": true, "swedish_ci": true, "turkish_ci": true,
 }
 
 // DTPMode controls the DATETIME_PRECISION shim.
@@ -818,7 +889,7 @@ func BackendHasDatetimePrecision(version string) (has, recognised bool) {
 	if !ok {
 		return true, false
 	}
-	if strings.Contains(strings.ToLower(v), "mariadb") {
+	if strings.Contains(asciiFold(v), "mariadb") {
 		return major > 5 || (major == 5 && minor >= 3), true
 	}
 	return major > 5 || (major == 5 && minor >= 6), true
@@ -874,7 +945,7 @@ func majorMinor(v string) (major, minor int, ok bool) {
 // backtick-quoted `DATETIME_PRECISION` are both left alone.
 func RewriteDatetimePrecision(q string) string {
 	const needle = "datetime_precision"
-	lower := strings.ToLower(q)
+	lower := asciiFold(q)
 	if !strings.Contains(lower, "information_schema") || !strings.Contains(lower, needle) {
 		return q
 	}

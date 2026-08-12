@@ -52,6 +52,7 @@ fmt:
 
 ## cover: unit test coverage over the packages that matter
 cover:
+	@mkdir -p $(BIN_DIR)
 	$(GO) test -coverpkg=./internal/... -coverprofile=$(BIN_DIR)/cover.out ./test/unit/...
 	$(GO) tool cover -func=$(BIN_DIR)/cover.out | tail -1
 

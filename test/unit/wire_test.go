@@ -377,3 +377,105 @@ func TestIsEOF(t *testing.T) {
 		t.Error("an empty packet is not EOF")
 	}
 }
+
+// TestParseHandshakeResponse41Malformed feeds the parser truncated and
+// unterminated packets. This runs before authentication, on bytes from anyone
+// who can open a socket, so every one of these has to come back as an error:
+// a panic here would take down the process and every connection it is relaying.
+func TestParseHandshakeResponse41Malformed(t *testing.T) {
+	header := func(caps uint32) []byte {
+		p := []byte{byte(caps), byte(caps >> 8), byte(caps >> 16), byte(caps >> 24)}
+		p = append(p, 0, 0, 0, 1, 33)
+		return append(p, make([]byte, 23)...)
+	}
+	const p41 = mysqlwire.CapProtocol41
+
+	tests := []struct {
+		name   string
+		packet []byte
+	}{
+		{"empty", nil},
+		{"header only", header(p41)},
+		{"username with no terminator", append(header(p41), "unterminated"...)},
+		{
+			// The case that used to panic: the length-encoded branch sliced at
+			// an offset one past the end of the packet.
+			"unterminated username, lenenc auth data",
+			append(header(p41|mysqlwire.CapPluginAuthLenenc), "unterminated"...),
+		},
+		{
+			"lenenc length longer than the packet",
+			append(append(header(p41|mysqlwire.CapPluginAuthLenenc), "user\x00"...), 0xFC, 0xFF, 0xFF),
+		},
+		{
+			"secure-connection length longer than the packet",
+			append(append(header(p41|mysqlwire.CapSecureConnection), "user\x00"...), 200),
+		},
+		{
+			"auth response with no terminator",
+			append(header(p41), "user\x00somepassword"...),
+		},
+		{
+			"schema promised but absent",
+			append(header(p41|mysqlwire.CapSecureConnection|mysqlwire.CapConnectWithDB), "user\x00\x00"...),
+		},
+		{
+			"schema with no terminator",
+			append(header(p41|mysqlwire.CapSecureConnection|mysqlwire.CapConnectWithDB), "user\x00\x00legacydb"...),
+		},
+		{"truncated header", []byte{0x0D, 0x00}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked on a malformed packet: %v", r)
+				}
+			}()
+			// Either outcome is fine as long as it is not a panic; what must
+			// never happen is a parse that succeeds on nonsense and then reads
+			// past the end somewhere else.
+			if h, err := mysqlwire.ParseHandshakeResponse41(tc.packet); err == nil {
+				t.Logf("accepted: user=%q db=%q authResp=%d bytes", h.User, h.DB, len(h.AuthResp))
+			}
+		})
+	}
+}
+
+// TestParseHandshakeResponse41Fuzz truncates a well-formed packet at every
+// length and checks none of the prefixes panics.
+func TestParseHandshakeResponse41Fuzz(t *testing.T) {
+	caps := mysqlwire.CapProtocol41 | mysqlwire.CapSecureConnection |
+		mysqlwire.CapConnectWithDB | mysqlwire.CapPluginAuth
+	full := mysqlwire.BuildHandshakeResponse41(caps, 33, "appuser",
+		mysqlwire.NativePassword([]byte("12345678901234567890"), "hunter2"),
+		"legacydb", mysqlwire.NativePasswordPlugin)
+
+	for n := 0; n <= len(full); n++ {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("panicked on the first %d bytes of a valid packet: %v", n, r)
+				}
+			}()
+			mysqlwire.ParseHandshakeResponse41(full[:n])
+		}()
+	}
+	// And with each capability bit flipped on, since the parse is driven by
+	// what the client claims rather than what it sent.
+	for bit := 0; bit < 32; bit++ {
+		c := caps | uint32(1)<<bit
+		p := append([]byte(nil), full...)
+		p[0], p[1], p[2], p[3] = byte(c), byte(c>>8), byte(c>>16), byte(c>>24)
+		for n := 0; n <= len(p); n++ {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("panicked with caps 0x%08x at %d bytes: %v", c, n, r)
+					}
+				}()
+				mysqlwire.ParseHandshakeResponse41(p[:n])
+			}()
+		}
+	}
+}

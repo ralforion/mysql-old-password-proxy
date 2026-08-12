@@ -101,6 +101,14 @@ regexp checks on `COM_QUERY` payloads.
   predates `utf8mb4` (added in 5.5) and drivers issue `SET NAMES utf8mb4`. It is
   a blunt replacement: a query carrying that literal *in data* is rewritten too.
   The same mapping is applied to the character set in the handshake.
+
+  Collations are handled rather than renamed. `utf8mb4` gained collations the
+  old `utf8` never had, so a plain substitution invents names no server knows —
+  `utf8mb4_0900_ai_ci`, MySQL 8.0's default, would become `utf8_0900_ai_ci` and
+  be refused. Suffixes that the old character set really has are carried across
+  (`utf8mb4_unicode_ci` → `utf8_unicode_ci`); anything else becomes
+  `utf8_general_ci`, which changes sort order for the session but leaves a
+  connection that opens.
 - **`-rewrite-datetime-precision`** (default `auto`) replaces the
   `DATETIME_PRECISION` column with the literal `0` in `information_schema`
   queries, but only when the backend predates the column. That column arrived

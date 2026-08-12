@@ -325,9 +325,30 @@ type HandshakeResponse struct {
 	AuthResp []byte
 }
 
+// readNulString reads a NUL-terminated string starting at i. It returns the
+// string and the offset just past the terminator, which is always within
+// bounds, so callers can slice at it safely.
+func readNulString(p []byte, i int) (string, int, error) {
+	if i > len(p) {
+		return "", len(p), errors.New("truncated packet")
+	}
+	for j := i; j < len(p); j++ {
+		if p[j] == 0 {
+			return string(p[i:j]), j + 1, nil
+		}
+	}
+	return "", len(p), errors.New("unterminated string")
+}
+
 // ParseHandshakeResponse41 parses a client's reply to the initial handshake.
 // It requires CLIENT_PROTOCOL_41 and rejects an SSLRequest, both of which the
 // relay cannot serve.
+//
+// Every offset is checked before it is used. This runs before authentication,
+// on bytes from anyone who can open a socket, so a malformed packet has to
+// come back as an error rather than a panic — an unterminated username in a
+// packet claiming CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA used to take the whole
+// process down, and with it every other connection it was relaying.
 func ParseHandshakeResponse41(p []byte) (*HandshakeResponse, error) {
 	if len(p) < 4 {
 		return nil, errors.New("short handshake response")
@@ -339,24 +360,27 @@ func ParseHandshakeResponse41(p []byte) (*HandshakeResponse, error) {
 	if h.Caps&CapSSL != 0 {
 		return nil, errors.New("client requested TLS, which the relay does not offer")
 	}
-	if len(p) < 33 {
+	// caps(4) + max packet(4) + charset(1) + reserved(23)
+	const headerLen = 32
+	if len(p) < headerLen {
 		return nil, errors.New("short handshake response")
 	}
 	h.Charset = p[8]
-	i := 32 // caps(4) + max packet(4) + charset(1) + reserved(23)
 
-	start := i
-	for i < len(p) && p[i] != 0 {
-		i++
+	user, i, err := readNulString(p, headerLen)
+	if err != nil {
+		return nil, fmt.Errorf("username: %w", err)
 	}
-	h.User = string(p[start:i])
-	i++
+	h.User = user
 
 	switch {
 	case h.Caps&CapPluginAuthLenenc != 0:
 		n, adv := LenencInt(p[i:])
+		if adv == 0 {
+			return nil, errors.New("truncated auth response length")
+		}
 		i += adv
-		if adv == 0 || i+int(n) > len(p) {
+		if n > uint64(len(p)-i) {
 			return nil, errors.New("truncated auth response")
 		}
 		h.AuthResp = p[i : i+int(n)]
@@ -367,34 +391,36 @@ func ParseHandshakeResponse41(p []byte) (*HandshakeResponse, error) {
 		}
 		n := int(p[i])
 		i++
-		if i+n > len(p) {
+		if n > len(p)-i {
 			return nil, errors.New("truncated auth response")
 		}
 		h.AuthResp = p[i : i+n]
 		i += n
 	default:
-		start = i
-		for i < len(p) && p[i] != 0 {
-			i++
+		resp, next, err := readNulString(p, i)
+		if err != nil {
+			return nil, fmt.Errorf("auth response: %w", err)
 		}
-		h.AuthResp = p[start:i]
-		i++
+		h.AuthResp, i = []byte(resp), next
 	}
 
-	if h.Caps&CapConnectWithDB != 0 && i <= len(p) {
-		start = i
-		for i < len(p) && p[i] != 0 {
-			i++
+	// The schema and the plugin name are optional tails. A client that sets the
+	// capability but sends nothing is tolerated: the field is simply empty.
+	if h.Caps&CapConnectWithDB != 0 && i < len(p) {
+		db, next, err := readNulString(p, i)
+		if err != nil {
+			return nil, fmt.Errorf("schema: %w", err)
 		}
-		h.DB = string(p[start:min(i, len(p))])
-		i++
+		h.DB, i = db, next
 	}
 	if h.Caps&CapPluginAuth != 0 && i < len(p) {
-		start = i
-		for i < len(p) && p[i] != 0 {
-			i++
+		// An unterminated plugin name is not worth refusing a connection over:
+		// what remains of the packet is the name.
+		plugin, _, err := readNulString(p, i)
+		if err != nil {
+			plugin = string(p[i:])
 		}
-		h.Plugin = string(p[start:i])
+		h.Plugin = plugin
 	}
 	return h, nil
 }
