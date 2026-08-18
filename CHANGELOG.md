@@ -6,6 +6,44 @@ why; the commit messages carry the detail and the measurements behind them.
 This project follows [semantic versioning](https://semver.org/). While the major
 version is 0, a minor bump may change flag semantics — each one below says so.
 
+## [0.3.1] — 2026-08-18
+
+Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.6, which
+carries three standard-library fixes; none of them appears to be triggerable in
+this program, so this is hygiene rather than an urgent upgrade.
+
+### Security
+
+- **Rebuilt on Go 1.26.6.** It fixes three advisories that `govulncheck`
+  reaches from this binary: [GO-2026-6090](https://pkg.go.dev/vuln/GO-2026-6090)
+  in `crypto/tls`, where post-handshake `KeyUpdate` messages were always treated
+  as state-advancing and could be replayed to force repeated key derivation;
+  [GO-2026-6089](https://pkg.go.dev/vuln/GO-2026-6089) in `net/http`, where
+  `ReadHeaderTimeout` was not applied while sniffing a new connection for the
+  unencrypted HTTP/2 preface; and
+  [GO-2026-5972](https://pkg.go.dev/vuln/GO-2026-5972) in `encoding/asn1`,
+  where `Unmarshal` had no recursion limit.
+
+  Reachable is not the same as exploitable, and as far as the conditions each
+  one needs go, this binary meets none of them: it opens no TLS connection of
+  its own — the legacy backends it exists to talk to predate any TLS worth
+  configuring — the health server leaves `Protocols` at the default, so it never
+  offers unencrypted HTTP/2, and nothing here parses ASN.1. The traces run
+  through `serveHealth`, the packet reader and `signal.NotifyContext`, which is
+  the call graph being conservative rather than three live holes. The bump is
+  still the right move: the standard library is the whole dependency tree here,
+  so keeping it current is the only supply-chain lever this project has.
+
+### Build
+
+- The Go toolchain is pinned in `go.mod` as well as in the `Dockerfile`, and
+  both now move together. The image bump alone left the scan red, because
+  `govulncheck` runs against the toolchain named in `go.mod` — the released
+  image would have been clean while CI said otherwise.
+- Release notes are taken from this file: the tag workflow publishes the section
+  for the version being tagged, falling back to commit subjects for the releases
+  that predate it.
+
 ## [0.3.0] — 2026-08-12
 
 Two of these are availability fixes reachable from the network, so this release
@@ -102,6 +140,7 @@ First release.
 - Published as a single static binary on `scratch`: no shell, no libc, nothing
   else in the image.
 
+[0.3.1]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/ralforion/mysql-old-password-proxy/releases/tag/v0.1.0
