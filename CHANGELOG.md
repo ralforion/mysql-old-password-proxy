@@ -6,6 +6,77 @@ why; the commit messages carry the detail and the measurements behind them.
 This project follows [semantic versioning](https://semver.org/). While the major
 version is 0, a minor bump may change flag semantics — each one below says so.
 
+## [0.3.2] — 2026-08-21
+
+Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.7, which
+carries a single standard-library fix, and that fix is not reachable from this
+program either. Hygiene, on the same reasoning as 0.3.1.
+
+What did change is what CI enforces: the Actions are pinned to commit SHAs and
+verified against the releases their comments name, and the third-party notice is
+generated rather than assumed. None of it reaches the binary.
+
+### Build
+
+- **Rebuilt on Go 1.26.7.** Its one fix is
+  [#80876](https://github.com/golang/go/issues/80876) in `net/http`, where a
+  connection-level `ReadHeaderTimeout` deadline stayed armed after a connection
+  was handed off to the unencrypted HTTP/2 server, so healthy long-lived h2c
+  connections were cut at the timeout. It is a regression from the fix for
+  [GO-2026-6089](https://pkg.go.dev/vuln/GO-2026-6089) that 0.3.1 picked up —
+  the new code set a read deadline before sniffing for the HTTP/2 preface and
+  only cleared it when `Server.ReadTimeout` was non-zero.
+
+  The health server does set `ReadHeaderTimeout` (5s) and leaves `ReadTimeout`
+  at zero, which is half of what the bug needs. The other half it never
+  supplies: reaching the h2c path requires opting in with
+  `Protocols.SetUnencryptedHTTP2(true)`, and `serveHealth` leaves `Protocols`
+  at the default, so no connection is ever handed to the HTTP/2 server. Probes
+  are unaffected.
+
+- Go 1.27.0 was released the same day and was evaluated instead. It builds,
+  vets and tests clean here, and none of its changes touch this code — no
+  `encoding/json`, no TLS, no unix sockets, no `godebug` directives, and the
+  SHA-1 scramble is untouched, since Go's SHA-1 restrictions have only ever
+  applied to x509 signature verification and not to `crypto/sha1` itself. It
+  was passed over only because there is no reason to run a two-day-old major
+  when the fix on offer is not reachable anyway. 1.27 is for a later release.
+
+  Dependabot's PR proposing `1.27.0-alpine` is closed with `ignore this minor
+  version`, so it will keep offering 1.26.x patches and stop re-proposing the
+  minor until that is lifted.
+
+### Supply chain
+
+Nothing here changes the binary either, but it changes what CI will let through.
+
+- **Every Action is pinned to a commit SHA**, across both workflows, with the
+  release it belongs to named in a comment beside it. They were floating on
+  major tags, and a tag is a movable label its owner can repoint at any time.
+
+- **`scripts/check-action-pins.sh` verifies those pins**, resolving each
+  comment's tag upstream and failing when the SHA is not the commit that tag
+  names. Without it the comment is the only part a reviewer reads and nothing
+  makes the two agree — which is what makes a hash swapped for one taken from a
+  fork look like a routine bump. Forks share object storage with their parent,
+  so such a commit resolves under the real repository's URL too, and only
+  resolving the tag tells them apart.
+
+  It runs as its own job that every other job needs, and is a required check on
+  `main`. Both halves matter: running it alongside the others would be too late,
+  since a parallel job has already run its own `uses:` before the check can
+  fail; and a job whose `needs:` failed reports as *skipped*, which branch
+  protection counts as satisfied — so dropping it from the required list would
+  let a failing pin check skip the rest into a green merge.
+
+- **`THIRD-PARTY-NOTICES.md` records that there are no third-party
+  dependencies** — `go.mod` declares no requires and there is no `go.sum` —
+  and `scripts/gen-notices.sh --check` re-derives that on every run, so the
+  claim cannot quietly become false the first time one is added.
+
+- `go*.tar.gz` is ignored. A 62 MB toolchain tarball was sitting in the tree
+  untracked and unignored, one `git add .` from entering history for good.
+
 ## [0.3.1] — 2026-08-18
 
 Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.6, which
@@ -140,6 +211,7 @@ First release.
 - Published as a single static binary on `scratch`: no shell, no libc, nothing
   else in the image.
 
+[0.3.2]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.1.0...v0.2.0

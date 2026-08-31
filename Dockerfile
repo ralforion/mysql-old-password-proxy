@@ -28,7 +28,7 @@
 # compiler itself executes under QEMU emulation for every foreign platform,
 # which turns a seconds-long build into a minutes-long one. Go cross-compiles
 # natively with CGO off, so emulation buys nothing here.
-FROM --platform=$BUILDPLATFORM golang:1.26.6-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.26.7-alpine AS build
 
 WORKDIR /src
 
