@@ -14,13 +14,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build and unit test
+  pins:
+    name: Action pins
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - name: Verify every Action is pinned to its named release
+        run: ./scripts/check-action-pins.sh
+
+  build:
+    name: Build and unit test
+    needs: pins
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # No third-party dependencies means no go.sum, which the module cache
@@ -52,8 +62,14 @@ jobs:
       - name: Build
         run: CGO_ENABLED=0 go build -trimpath -o bin/mysql-old-password-proxy .
 
+      # Re-derived from the module graph on every run. The notice's claim is that
+      # nothing third-party is redistributed, and the only way that claim stays
+      # true is for the first added dependency to turn this red.
+      - name: Third-party notices are current
+        run: ./scripts/gen-notices.sh --check
+
       - name: Image builds
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           push: false
@@ -61,15 +77,16 @@ jobs:
             VERSION=ci-${{ github.sha }}
 
   integration:
+    needs: pins
     name: Integration (real MySQL servers)
     runs-on: ubuntu-latest
     # The suite starts MySQL 5.5 and 5.6 containers and pulls three client
     # images, so it is slower than the unit tests but still well under an hour.
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # No third-party dependencies means no go.sum, which the module cache
@@ -88,12 +105,13 @@ jobs:
         run: go test -tags integration -count=1 -timeout 40m -v ./test/integration/...
 
   security:
+    needs: pins
     name: Vulnerability scan
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: actions/setup-go@v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # No third-party dependencies means no go.sum, which the module cache

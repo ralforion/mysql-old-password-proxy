@@ -6,3 +6,8 @@
 # Local overrides
 .env
 *.local.yaml
+
+# Go toolchain tarballs downloaded for local builds. A 62 MB archive sat here
+# untracked and unignored, one `git add .` away from entering history — and once
+# a blob that size is in history it stays there for every future clone.
+go*.tar.gz
