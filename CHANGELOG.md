@@ -6,6 +6,52 @@ why; the commit messages carry the detail and the measurements behind them.
 This project follows [semantic versioning](https://semver.org/). While the major
 version is 0, a minor bump may change flag semantics — each one below says so.
 
+## [0.3.3] — 2026-09-08
+
+Nothing in the proxy itself changed, and this time nothing in the toolchain
+reaches it either. The binary is rebuilt on Go 1.26.8, whose fixes are all in
+code this build never compiles, never imports or never runs. Hygiene, on the
+same reasoning as 0.3.1 and 0.3.2, with less behind it than either.
+
+### Build
+
+- **Rebuilt on Go 1.26.8.** It carries no advisories, so `govulncheck` reports
+  the same nothing before and after. Its six backports miss this binary on four
+  separate grounds:
+
+  - [#80851](https://github.com/golang/go/issues/80851), a `#cgo` directive
+    whose `FFLAGS` value was mixed up with `CXXFLAGS`, needs cgo — and this
+    builds with `CGO_ENABLED=0`, which is what makes the `scratch` image
+    possible in the first place.
+  - [#80827](https://github.com/golang/go/issues/80827), where async preemption
+    corrupted AVX (YMM) register state, is netbsd/amd64. The images are
+    linux/amd64 and linux/arm64.
+  - [#81113](https://github.com/golang/go/issues/81113), a PowerPC relocation
+    broken in `debug/elf`, is in a package this tree does not import.
+  - [#81152](https://github.com/golang/go/issues/81152) and
+    [#80889](https://github.com/golang/go/issues/80889) are failures in Go's
+    own test suite, and [#77800](https://github.com/golang/go/issues/77800) is
+    `cmd/fix` reporting fixes it had not applied. None of the three reaches a
+    shipped artifact.
+
+  The image pin and the `go` directive moved together, as they have since
+  0.3.1. That is not bookkeeping: `govulncheck` builds with the toolchain
+  `go.mod` names while the released image is built with the one the
+  `Dockerfile` pins, and it was letting those two drift that left the scan red
+  when 0.3.1's image bump first landed on its own.
+
+- **`docker/setup-qemu-action` moved to v4.3.0**, re-pinned to the commit that
+  tag names and checked against upstream by `scripts/check-action-pins.sh`. The
+  release is dependency bumps inside the action itself, so nothing changes about
+  how binfmt handlers are registered before the arm64 cross-build.
+
+- Go 1.27 is still deferred, and now has a patch release of its own in 1.27.1.
+  Worth knowing where that decision is written down: the condition keeping
+  Dependabot on 1.26.x was set by commenting on a pull request, so it lives in
+  Dependabot's state and not in `.github/dependabot.yml`. Nothing in the tree
+  records it, and lifting it means an `@dependabot unignore` comment rather than
+  an edit here.
+
 ## [0.3.2] — 2026-08-21
 
 Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.7, which
@@ -211,6 +257,7 @@ First release.
 - Published as a single static binary on `scratch`: no shell, no libc, nothing
   else in the image.
 
+[0.3.3]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.2.0...v0.3.0
