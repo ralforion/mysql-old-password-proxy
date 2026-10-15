@@ -6,6 +6,69 @@ why; the commit messages carry the detail and the measurements behind them.
 This project follows [semantic versioning](https://semver.org/). While the major
 version is 0, a minor bump may change flag semantics — each one below says so.
 
+## [0.3.4] — 2026-10-15
+
+Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.9, a
+security release, and unlike the last three rebuilds one of its fixes does
+reach this program: the health endpoint could be talked into serving requests
+after a `CONNECT`. It is low impact and needs an unusual deployment to matter,
+but it is a real behaviour of the shipped binary, not a call graph being
+conservative.
+
+### Security
+
+- **Rebuilt on Go 1.26.9.** On 1.26.8 `govulncheck` reaches seven advisories
+  from this binary, in `net/http`, `crypto/tls` and `net/textproto`. One applies:
+
+  - [GO-2026-6613](https://pkg.go.dev/vuln/GO-2026-6613) in `net/http`: when a
+    handler answers an HTTP/1 `CONNECT` with a 2xx and returns without hijacking
+    the connection, the server kept reading the rest of the connection as HTTP,
+    although a 2xx to `CONNECT` turns it into a tunnel. The health handlers are
+    registered without a method, so `CONNECT /healthz` gets a `200`. Sending
+    that with a `GET /readyz` behind it on one connection gets two responses
+    on 1.26.8 and one on 1.26.9, which closes the connection instead.
+
+    What it enables is request smuggling, and only where something in front of
+    the health port forwards `CONNECT` and then treats the connection as a
+    tunnel. A kubelet probing the port directly does not. The endpoints are
+    read-only and expose nothing beyond the version, the backend capability
+    flags and a connection count, so the most a smuggled request can do is
+    read those.
+
+  The other six need something this binary never does:
+
+  - [GO-2026-6603](https://pkg.go.dev/vuln/GO-2026-6603),
+    [GO-2026-6611](https://pkg.go.dev/vuln/GO-2026-6611),
+    [GO-2026-6612](https://pkg.go.dev/vuln/GO-2026-6612) and
+    [GO-2026-6617](https://pkg.go.dev/vuln/GO-2026-6617) are all in the HTTP/2
+    server: memory exhaustion through declared `Trailer` fields, CPU through
+    repeated `SETTINGS_INITIAL_WINDOW_SIZE` changes, a double flow-control
+    refund, and a crash from an HPACK encoder race. The health server speaks
+    HTTP/1 only. It has no TLS, so no ALPN, and it leaves `Protocols` at the
+    default, so it never offers unencrypted HTTP/2.
+  - [GO-2026-6607](https://pkg.go.dev/vuln/GO-2026-6607), memory exhaustion
+    from repeated ECH outer extension references, is in the `crypto/tls`
+    server. Nothing here terminates TLS.
+  - [GO-2026-6608](https://pkg.go.dev/vuln/GO-2026-6608) bypasses the memory
+    limit while parsing multipart MIME headers. The health handlers never read
+    the request body, let alone parse a form.
+
+  The image pin and the `go` directive moved together again. Dependabot bumped
+  only the `Dockerfile`, so the scan stayed on 1.26.8 and went red on exactly
+  these seven until `go.mod` followed.
+
+### Build
+
+- **`docker/build-push-action` moved to v7.4.0**, which stops printing buildx
+  metadata to the job log unescaped. Since buildx v0.30.0 that metadata can
+  carry the whole GitHub event payload, so a commit message could inject
+  workflow commands into the release job, which holds the Docker Hub token.
+  The commit messages it sees are ours and Dependabot's, so there was little
+  exposure, but the fix is worth having. `docker/setup-qemu-action` (v4.4.0)
+  and `docker/setup-buildx-action` (v4.4.1) moved alongside it, and the release
+  notes of neither touch anything this build uses. All three are re-pinned to
+  the commits their tags name.
+
 ## [0.3.3] — 2026-09-08
 
 Nothing in the proxy itself changed, and this time nothing in the toolchain
@@ -257,6 +320,7 @@ First release.
 - Published as a single static binary on `scratch`: no shell, no libc, nothing
   else in the image.
 
+[0.3.4]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/ralforion/mysql-old-password-proxy/compare/v0.3.0...v0.3.1
