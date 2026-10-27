@@ -6,6 +6,34 @@ why; the commit messages carry the detail and the measurements behind them.
 This project follows [semantic versioning](https://semver.org/). While the major
 version is 0, a minor bump may change flag semantics — each one below says so.
 
+## [0.3.5] — 2026-10-27
+
+Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.10 for
+one advisory that `govulncheck` reaches through the call graph but that the
+running program never triggers. It is back to hygiene, unlike 0.3.4.
+
+### Security
+
+- **Rebuilt on Go 1.26.10.** On 1.26.9 `govulncheck` reports
+  [GO-2026-6809](https://pkg.go.dev/vuln/GO-2026-6809): `crypto/x509` gains a
+  denylist so that `Certificate.Verify` rejects a set of compromised
+  intermediate certificates, for systems whose trust stores have not caught up.
+  `crypto/x509` is linked in, through `net/http` for the health server, but
+  `Verify` only runs while verifying a peer's chain in a TLS handshake, and this
+  binary never does one: the health server has no TLS, and the relay is
+  plaintext on both sides and rejects an `SSLRequest`. The trace `govulncheck`
+  prints starts at `io.ReadFull` in `mysqlwire.ReadPacketInto`, because it
+  cannot rule out a `tls.Conn` behind the `io.Reader`.
+
+  The image pin and the `go` directive moved together, as in 0.3.4.
+
+### Build
+
+- **`docker/login-action` moved to v4.7.0.** Its changes are in ECR and Docker
+  Hub OIDC login and its dependencies. The release job logs in to Docker Hub
+  with a username and token, which behaves as before. It is re-pinned to the
+  commit its tag names.
+
 ## [0.3.4] — 2026-10-15
 
 Nothing in the proxy itself changed. The binary is rebuilt on Go 1.26.9, a
